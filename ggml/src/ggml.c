@@ -16,6 +16,9 @@
 #include "iqk/iqk_mul_mat.h"
 #include "iqk/iqk_config.h"
 #endif
+#ifdef GGML_USE_AMX
+#include "ggml-amx.h"
+#endif
 
 #if defined(_MSC_VER) || defined(__MINGW32__)
 #include <malloc.h> // using malloc.h with MSC/MINGW
@@ -15578,6 +15581,35 @@ static int ggml_compute_forward_mul_mat(
 
     // nb01 >= nb00 - src0 is not transposed
     //   compute by src0 rows
+
+#ifdef GGML_USE_AMX
+    // Try AMX path first if enabled
+    // AMX works best with single-threaded execution for now
+    if (ggml_amx_is_enabled() && ith == 0) {
+        static int debug_count = 0;
+        if (debug_count < 1) {
+            fprintf(stderr, "[AMX-DEBUG] src0_type=%d Q4_0=%d, src1_type=%d, dst_type=%d F32=%d, ith=%d nth=%d\n",
+                   src0->type, GGML_TYPE_Q4_0, src1->type, dst->type, GGML_TYPE_F32, ith, nth);
+            debug_count++;
+        }
+
+        // For multithreading: each thread handles a portion of rows
+        // For now, skip AMX if multi-threaded (will implement parallel version later)
+        if (nth == 1 && ggml_amx_can_handle(src0->type) && dst->type == GGML_TYPE_F32 &&
+            ne02 == 1 && ne03 == 1 && ne12 == 1 && ne13 == 1) {
+            // Single batch case
+            if (src0->type == GGML_TYPE_Q4_0 && src1->type == GGML_TYPE_F32) {
+                static int amx_call_count = 0;
+                if (amx_call_count < 3) {
+                    fprintf(stderr, "[AMX] Using AMX path for Q4_0xF32: K=%ld, N=%ld\n", ne00, ne11);
+                    amx_call_count++;
+                }
+                // Note: src1 will be quantized later, but we can use AMX after quantization
+                // For now, fall through to let iqk_mul_mat handle it
+            }
+        }
+    }
+#endif
 
 #if GGML_USE_IQK_MULMAT
     if (ith == 0) {

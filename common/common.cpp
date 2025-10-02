@@ -998,6 +998,10 @@ bool gpt_params_find_arg(int argc, char ** argv, const std::string & arg, gpt_pa
         params.flash_attn = true;
         return true;
     }
+    if (arg == "--amx") {
+        params.use_amx = true;
+        return true;
+    }
     if (arg == "-mla" || arg == "--mla-use") {
         CHECK_ARG
         params.mla_attn = std::stoi(argv[i]);
@@ -1797,6 +1801,7 @@ void gpt_params_print_usage(int /*argc*/, char ** argv, const gpt_params & param
     options.push_back({ "*",           "       --keep N",               "number of tokens to keep from the initial prompt (default: %d, -1 = all)", params.n_keep });
     options.push_back({ "*",           "       --chunks N",             "max number of chunks to process (default: %d, -1 = all)", params.n_chunks });
     options.push_back({ "*",           "-fa,   --flash-attn",           "enable Flash Attention (default: %s)", params.flash_attn ? "enabled" : "disabled" });
+    options.push_back({ "*",           "       --amx",                  "enable Intel AMX acceleration (default: %s)", params.use_amx ? "enabled" : "disabled" });
     options.push_back({ "*",           "-mla,  --mla-use",              "enable MLA (default: %d)", params.mla_attn });
     options.push_back({ "*",           "-amb,  --attention-max-batch",  "max batch size for attention computations (default: %d)", params.attn_max_batch});
     options.push_back({ "*",           "-fmoe, --fused-moe",            "enable fused MoE (default: %s)", params.fused_moe_up_gate ? "enabled" : "disabled" });
@@ -2526,7 +2531,36 @@ std::string fs_get_cache_file(const std::string & filename) {
 //
 // Model utils
 //
+
+// Forward-declare AMX functions from ggml library (with C linkage)
+extern "C" {
+    void ggml_amx_set_enabled(bool enabled);
+    #if defined(__AMX_INT8__) && defined(__AVX512VNNI__)
+    bool ggml_amx_int8_init(void);
+    #endif
+    #if defined(__AMX_BF16__)
+    bool ggml_amx_bf16_init(void);
+    #endif
+}
+
 struct llama_init_result llama_init_from_gpt_params(gpt_params & params) {
+    // Enable/disable AMX based on --amx flag
+    if (params.use_amx) {
+        ggml_amx_set_enabled(true);
+        #if defined(__AMX_INT8__) && defined(__AVX512VNNI__)
+        if (!ggml_amx_int8_init()) {
+            fprintf(stderr, "Warning: AMX-INT8 initialization failed\n");
+        }
+        #endif
+        #if defined(__AMX_BF16__)
+        if (!ggml_amx_bf16_init()) {
+            fprintf(stderr, "Warning: AMX-BF16 initialization failed\n");
+        }
+        #endif
+    } else {
+        ggml_amx_set_enabled(false);
+    }
+
     llama_init_result iparams;
     auto mparams = llama_model_params_from_gpt_params(params);
 

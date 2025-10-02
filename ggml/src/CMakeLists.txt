@@ -1381,6 +1381,23 @@ elseif (CMAKE_OSX_ARCHITECTURES STREQUAL "x86_64" OR CMAKE_GENERATOR_PLATFORM_LW
         if (GGML_AVX512_BF16)
             list(APPEND ARCH_FLAGS -mavx512bf16)
         endif()
+        # Intel AMX support (requires tile configuration)
+        if (GGML_AMX OR GGML_AMX_TILE OR GGML_AMX_INT8 OR GGML_AMX_BF16)
+            list(APPEND ARCH_FLAGS -mamx-tile)
+        endif()
+        # AMX-INT8 for quantized types (requires AVX512VNNI)
+        if (GGML_AMX OR GGML_AMX_INT8)
+            list(APPEND ARCH_FLAGS -mamx-int8)
+            # Ensure AVX512VNNI is enabled for AMX-INT8
+            if (NOT GGML_AVX512_VNNI)
+                message(STATUS "AMX-INT8 requires AVX512-VNNI, enabling it automatically")
+                list(APPEND ARCH_FLAGS -mavx512vnni)
+            endif()
+        endif()
+        # AMX-BF16 for floating point types
+        if (GGML_AMX_BF16)
+            list(APPEND ARCH_FLAGS -mamx-bf16)
+        endif()
     endif()
 elseif (${CMAKE_SYSTEM_PROCESSOR} MATCHES "ppc64")
     message(STATUS "PowerPC detected")
@@ -1510,10 +1527,27 @@ add_library(ggml
             ${GGML_SOURCES_IQK}       ${GGML_HEADERS_IQK}
             ${GGML_SOURCES_CANN}      ${GGML_HEADERS_CANN}
             ggml-aarch64.c            ggml-aarch64.h
+            ggml-amx.c                ggml-amx.h
+            ggml-amx-impl.c
+            ggml-amx-kernel.c
             )
 
 if (EMSCRIPTEN)
     set_target_properties(ggml PROPERTIES COMPILE_FLAGS "-msimd128")
+endif()
+
+# AMX compile definitions
+if (GGML_AMX OR GGML_AMX_INT8 OR GGML_AMX_BF16)
+    target_compile_definitions(ggml PRIVATE GGML_USE_AMX)
+    message(STATUS "Intel AMX support enabled")
+    if (GGML_AMX_INT8)
+        target_compile_definitions(ggml PRIVATE GGML_USE_AMX_INT8)
+        message(STATUS "  - AMX-INT8 enabled (quantized types)")
+    endif()
+    if (GGML_AMX_BF16)
+        target_compile_definitions(ggml PRIVATE GGML_USE_AMX_BF16)
+        message(STATUS "  - AMX-BF16 enabled (floating point types)")
+    endif()
 endif()
 
 target_compile_definitions(ggml PUBLIC  ${GGML_CDEF_PUBLIC})
