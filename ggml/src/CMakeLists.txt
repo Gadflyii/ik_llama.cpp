@@ -1381,23 +1381,9 @@ elseif (CMAKE_OSX_ARCHITECTURES STREQUAL "x86_64" OR CMAKE_GENERATOR_PLATFORM_LW
         if (GGML_AVX512_BF16)
             list(APPEND ARCH_FLAGS -mavx512bf16)
         endif()
-        # Intel AMX support (requires tile configuration)
-        if (GGML_AMX OR GGML_AMX_TILE OR GGML_AMX_INT8 OR GGML_AMX_BF16)
-            list(APPEND ARCH_FLAGS -mamx-tile)
-        endif()
-        # AMX-INT8 for quantized types (requires AVX512VNNI)
-        if (GGML_AMX OR GGML_AMX_INT8)
-            list(APPEND ARCH_FLAGS -mamx-int8)
-            # Ensure AVX512VNNI is enabled for AMX-INT8
-            if (NOT GGML_AVX512_VNNI)
-                message(STATUS "AMX-INT8 requires AVX512-VNNI, enabling it automatically")
-                list(APPEND ARCH_FLAGS -mavx512vnni)
-            endif()
-        endif()
-        # AMX-BF16 for floating point types
-        if (GGML_AMX_BF16)
-            list(APPEND ARCH_FLAGS -mamx-bf16)
-        endif()
+        # Intel AMX support - flags applied per-file below, not globally
+        # (Removed from ARCH_FLAGS to avoid polluting IQK Flash Attention code)
+        # AMX-INT8 requires AVX512VNNI but we apply it per-file, not globally
     endif()
 elseif (${CMAKE_SYSTEM_PROCESSOR} MATCHES "ppc64")
     message(STATUS "PowerPC detected")
@@ -1555,6 +1541,32 @@ if (GGML_AMX OR GGML_AMX_INT8 OR GGML_AMX_BF16)
         target_compile_definitions(ggml PUBLIC GGML_USE_AMX_BF16)
         message(STATUS "  - AMX-BF16 enabled (floating point types)")
     endif()
+
+    # Apply AMX compiler flags ONLY to AMX-specific source files
+    # This prevents pollution of IQK Flash Attention and other code
+    set(AMX_COMPILE_FLAGS "")
+    list(APPEND AMX_COMPILE_FLAGS "-mamx-tile" "-mavx512f" "-mavx512dq" "-mavx512bw" "-mavx512vl")
+
+    if (GGML_AMX_INT8 OR GGML_AMX)
+        list(APPEND AMX_COMPILE_FLAGS "-mamx-int8" "-mavx512vnni")
+    endif()
+
+    if (GGML_AMX_BF16)
+        list(APPEND AMX_COMPILE_FLAGS "-mamx-bf16")
+    endif()
+
+    # Convert list to space-separated string for COMPILE_FLAGS property
+    string(REPLACE ";" " " AMX_COMPILE_FLAGS_STR "${AMX_COMPILE_FLAGS}")
+
+    # Apply AMX flags only to AMX source files
+    set_source_files_properties(
+        ggml-cpu/amx/amx.cpp
+        ggml-cpu/amx/mmq.cpp
+        ggml-cpu-traits.cpp
+        PROPERTIES COMPILE_FLAGS "${AMX_COMPILE_FLAGS_STR}"
+    )
+
+    message(STATUS "  - AMX compiler flags applied to AMX source files only")
 endif()
 
 target_compile_definitions(ggml PUBLIC  ${GGML_CDEF_PUBLIC})

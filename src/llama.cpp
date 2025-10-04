@@ -1818,13 +1818,14 @@ static ggml_backend_buffer_type_t select_weight_buft(const struct ggml_tensor * 
     return ggml_backend_cpu_buffer_type();
 }
 
-// Create buffer type list for CPU layers
-// Priority order: AMX (if enabled) -> CPU host (if needed) -> CPU
-static buft_list_t make_cpu_buft_list(bool use_extra_bufts, bool no_host) {
+// Create buffer type list for CPU layers with AMX support
+// Priority order: AMX (if enabled) -> CPU host (if GPU present) -> CPU fallback
+// In this fork, --amx flag is the only control - no separate --no-host parameter
+static buft_list_t make_cpu_buft_list(bool use_amx_buffers, bool gpu_present) {
     buft_list_t buft_list;
 
-    // Add extra buffer types (AMX, etc.) if requested
-    if (use_extra_bufts) {
+    // Add AMX buffer types if requested (via --amx flag)
+    if (use_amx_buffers) {
         ggml_backend_buffer_type_t * extra_bufts = ggml_backend_cpu_get_extra_bufts();
         while (extra_bufts && *extra_bufts) {
             buft_list.push_back(*extra_bufts);
@@ -1832,8 +1833,8 @@ static buft_list_t make_cpu_buft_list(bool use_extra_bufts, bool no_host) {
         }
     }
 
-    // Add host buffer type if needed (for GPU transfers)
-    if (!no_host) {
+    // Add host buffer type when GPU is present (needed for CPU-GPU transfers)
+    if (gpu_present) {
 #if defined(GGML_USE_CUDA)
         ggml_backend_buffer_type_t host_buft = ggml_backend_cuda_host_buffer_type();
         if (host_buft) {
@@ -5000,28 +5001,35 @@ static bool llm_load_tensors(
     const int i_gpu_start = std::max((int) hparams.n_layer - n_gpu_layers, (int) 0);
     bool use_mmap_buffer = true;
 
-    // When --amx is enabled, bypass host buffers (similar to upstream's --no-host)
-    // For GPU operations, we still need host buffers for data transfers
-    bool need_host_buffer = (n_gpu_layers > 0);
-    bool use_extra_bufts = use_amx;  // Enable extra buffer types (AMX)
-    bool no_host = use_amx && (n_gpu_layers == 0);  // Skip host buffer if CPU-only with AMX
+    // CRITICAL FIX: Without --amx, must match main branch exactly
+    // Main branch always uses host_buffer=true for llama_default_buffer_type_cpu()
+    // Only when AMX is enabled AND CPU-only can we optimize host buffer usage
 
-    // CRITICAL: AMX buffer should ONLY be used for model weights (buft_layer), NOT for
-    // intermediate F32 tensors like embeddings/layer norms (buft_input/buft_output)
-    // buft_input stores embeddings which are F32, not quantized weights
-    model.buft_input = llama_default_buffer_type_cpu(need_host_buffer, false /* no AMX for F32 */);
+    // there is very little benefit to offloading the input layer, so always keep it on the CPU
+    model.buft_input = llama_default_buffer_type_cpu(true);
 
     model.buft_layer.resize(n_layer);
-    model.buft_layer_list.resize(n_layer);
 
-    // assign cpu layers - populate both legacy buft_layer and new buft_layer_list
+    // Only create buffer lists when AMX is actually enabled
+    if (use_amx) {
+        model.buft_layer_list.resize(n_layer);
+    }
+
+    // assign cpu layers
     for (int i = 0; i < i_gpu_start; ++i) {
-        // Legacy: single buffer type (kept for compatibility)
-        model.buft_layer[i] = llama_default_buffer_type_cpu(need_host_buffer, false /* don't force AMX */);
+        // BASELINE: Must match main branch exactly when --amx not set
+        model.buft_layer[i] = llama_default_buffer_type_cpu(true);
 
-        // Modern: buffer list with fallback priority
-        // Priority: AMX (if enabled) → CPU (always fallback)
-        model.buft_layer_list[i] = make_cpu_buft_list(use_extra_bufts, no_host);
+        // AMX path: Only populate buffer list when --amx flag is set
+        // In this fork, --amx is the only parameter (no --no-host like upstream)
+        if (use_amx) {
+            // AMX works for CPU layers in all scenarios:
+            // - CPU-only (i_gpu_start == n_layer): AMX buffers used directly, no host buffer needed
+            // - CPU+GPU hybrid (i_gpu_start < n_layer): AMX buffers for CPU layers, host buffers for GPU transfers
+            bool use_amx_buffers = true;                    // Always enable AMX when --amx flag set
+            bool gpu_layers_present = (i_gpu_start < n_layer); // True if ANY layers are on GPU
+            model.buft_layer_list[i] = make_cpu_buft_list(use_amx_buffers, gpu_layers_present);
+        }
     }
 
     if (split_mode == LLAMA_SPLIT_MODE_LAYER) {
@@ -5055,16 +5063,19 @@ static bool llm_load_tensors(
             model.buft_layer[i] = llama_default_buffer_type_offload(model, layer_gpu);
 
             // GPU layers: buffer list is just GPU buffer (no AMX on GPU layers)
-            buft_list_t gpu_list;
-            gpu_list.push_back(llama_default_buffer_type_offload(model, layer_gpu));
-            model.buft_layer_list[i] = gpu_list;
+            // Only create if AMX enabled (though it won't be used for GPU layers)
+            if (use_amx) {
+                buft_list_t gpu_list;
+                gpu_list.push_back(llama_default_buffer_type_offload(model, layer_gpu));
+                model.buft_layer_list[i] = gpu_list;
+            }
         }
         // assign the output layer
         if (n_gpu_layers > n_layer) {
             int layer_gpu = std::upper_bound(splits.begin(), splits.begin() + device_count, float(act_gpu_layers - 1)/act_gpu_layers) - splits.begin();
             model.buft_output = llama_default_buffer_type_offload(model, layer_gpu);
         } else {
-            model.buft_output = llama_default_buffer_type_cpu(need_host_buffer, false /* no AMX for F32 */);
+            model.buft_output = llama_default_buffer_type_cpu(true);
         }
     } else {
         ggml_backend_buffer_type_t split_buft;
@@ -5082,9 +5093,12 @@ static bool llm_load_tensors(
             };
 
             // GPU layers: buffer list is just GPU buffer (no AMX on GPU layers)
-            buft_list_t gpu_list;
-            gpu_list.push_back(split_buft);
-            model.buft_layer_list[i] = gpu_list;
+            // Only create if AMX enabled (though it won't be used for GPU layers)
+            if (use_amx) {
+                buft_list_t gpu_list;
+                gpu_list.push_back(split_buft);
+                model.buft_layer_list[i] = gpu_list;
+            }
         }
         // assign the output layer
         if (n_gpu_layers > n_layer) {
@@ -5093,7 +5107,7 @@ static bool llm_load_tensors(
                 llama_default_buffer_type_offload(model, main_gpu)
             };
         } else {
-            model.buft_output = llama_default_buffer_type_cpu(need_host_buffer, false /* no AMX for F32 */);
+            model.buft_output = llama_default_buffer_type_cpu(true);
         }
     }
 
@@ -5111,17 +5125,20 @@ static bool llm_load_tensors(
     }
 
     // ALSO count buffer types from buffer lists (for per-tensor selection)
-    // Only count unique buffer types to avoid duplicates
-    std::set<ggml_backend_buffer_type_t> unique_bufts;
-    for (int i = 0; i < n_layer; ++i) {
-        for (auto buft : model.buft_layer_list[i]) {
-            unique_bufts.insert(buft);
+    // Only when AMX is enabled (buffer lists only exist in AMX mode)
+    if (use_amx && model.buft_layer_list.size() > 0) {
+        // Only count unique buffer types to avoid duplicates
+        std::set<ggml_backend_buffer_type_t> unique_bufts;
+        for (int i = 0; i < n_layer; ++i) {
+            for (auto buft : model.buft_layer_list[i]) {
+                unique_bufts.insert(buft);
+            }
         }
-    }
-    for (auto buft : unique_bufts) {
-        // Only add if not already counted (avoid duplicate contexts)
-        if (buft_layer_count.find(buft) == buft_layer_count.end()) {
-            buft_layer_count[buft] = 1;  // Add with count of 1
+        for (auto buft : unique_bufts) {
+            // Only add if not already counted (avoid duplicate contexts)
+            if (buft_layer_count.find(buft) == buft_layer_count.end()) {
+                buft_layer_count[buft] = 1;  // Add with count of 1
+            }
         }
     }
 
@@ -5205,12 +5222,19 @@ static bool llm_load_tensors(
         auto ctx_for_layer_split = [&](int i) { return ctx_map.at(model.buft_layer[i].buft_matrix); };
 
         // Helper to select buffer type for a tensor from layer's buffer list
-        auto select_layer_buft = [&model, &ml](int layer_idx, const std::string & tensor_name) -> ggml_backend_buffer_type_t {
+        // BASELINE FIX: Only use buffer lists when AMX enabled, otherwise use legacy path
+        auto select_layer_buft = [&model, &ml, use_amx](int layer_idx, const std::string & tensor_name) -> ggml_backend_buffer_type_t {
+            // When AMX disabled OR buffer lists not created: use legacy path (matches main branch)
+            if (!use_amx || model.buft_layer_list.size() == 0 || layer_idx >= (int)model.buft_layer_list.size()) {
+                return model.buft_layer[layer_idx].buft;  // BASELINE: always use legacy when !AMX
+            }
+
             const buft_list_t & buft_list = model.buft_layer_list[layer_idx];
             if (buft_list.empty()) {
                 return model.buft_layer[layer_idx].buft;  // Fallback to legacy
             }
 
+            // AMX path: per-tensor selection from buffer list
             // Get tensor metadata to determine compatibility
             struct ggml_tensor * temp_tensor = ml.get_tensor_meta(tensor_name.c_str());
             if (temp_tensor) {
