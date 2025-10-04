@@ -48,6 +48,10 @@
 #  include "ggml-metal.h"
 #endif
 
+#ifdef GGML_USE_AMX
+#  include "ggml-cpu/amx/amx.h"
+#endif
+
 // TODO: replace with ggml API call
 #define QK_K 256
 #define QK_IQ1BN 64
@@ -1778,8 +1782,91 @@ static std::string llama_token_to_piece(const struct llama_model * model, llama_
     return piece;
 }
 
-ggml_backend_buffer_type_t llama_default_buffer_type_cpu(bool host_buffer) {
+// Buffer type list for selecting best buffer type for each tensor
+using buft_list_t = std::vector<ggml_backend_buffer_type_t>;
+
+// Select the first buffer type from the list that supports the given operation
+static ggml_backend_buffer_type_t select_weight_buft(const struct ggml_tensor * tensor, ggml_op op, const buft_list_t & buft_list) {
+    if (buft_list.empty()) {
+        return nullptr;
+    }
+
+    // Simple type-based filtering for AMX:
+    // AMX supports: Q4_0, Q4_1, Q8_0, Q4_K, Q5_K, Q6_K, IQ4_XS, F16, BF16
+    // AMX does NOT support: F32 (norms, biases, router weights must use CPU)
+    const bool amx_compatible = tensor->type != GGML_TYPE_F32;
+
+    // CRITICAL: MoE expert weights use MUL_MAT_ID which AMX doesn't support
+    // They must stay in CPU buffer with standard (non-VNNI) format
+    // Expert weights have "exps" in their name (ffn_gate_exps, ffn_down_exps, ffn_up_exps)
+    const bool is_moe_expert = strstr(tensor->name, "exps") != nullptr;
+
+    for (auto buft : buft_list) {
+        // Skip AMX buffer type for F32 tensors or MoE expert weights
+        const char * buft_name = ggml_backend_buft_name(buft);
+        if ((!amx_compatible || is_moe_expert) && buft_name && strstr(buft_name, "AMX")) {
+            continue;  // Skip AMX for F32 tensors and MoE experts
+        }
+
+        // Note: we don't call ggml_backend_buft_supports_op here because it expects
+        // an operation node, not a weight tensor. The simple type check above is sufficient.
+        return buft;  // Return first compatible buffer type
+    }
+
+    // Fallback: if no compatible buffer found in list (shouldn't happen), use standard CPU
+    // This ensures we never return nullptr which would cause buffer allocation failure
+    return ggml_backend_cpu_buffer_type();
+}
+
+// Create buffer type list for CPU layers
+// Priority order: AMX (if enabled) -> CPU host (if needed) -> CPU
+static buft_list_t make_cpu_buft_list(bool use_extra_bufts, bool no_host) {
+    buft_list_t buft_list;
+
+    // Add extra buffer types (AMX, etc.) if requested
+    if (use_extra_bufts) {
+        ggml_backend_buffer_type_t * extra_bufts = ggml_backend_cpu_get_extra_bufts();
+        while (extra_bufts && *extra_bufts) {
+            buft_list.push_back(*extra_bufts);
+            ++extra_bufts;
+        }
+    }
+
+    // Add host buffer type if needed (for GPU transfers)
+    if (!no_host) {
+#if defined(GGML_USE_CUDA)
+        ggml_backend_buffer_type_t host_buft = ggml_backend_cuda_host_buffer_type();
+        if (host_buft) {
+            buft_list.push_back(host_buft);
+        }
+#elif defined(GGML_USE_SYCL)
+        ggml_backend_buffer_type_t host_buft = ggml_backend_sycl_host_buffer_type();
+        if (host_buft) {
+            buft_list.push_back(host_buft);
+        }
+#endif
+    }
+
+    // Always add CPU buffer type as fallback
+    buft_list.push_back(ggml_backend_cpu_buffer_type());
+
+    return buft_list;
+}
+
+ggml_backend_buffer_type_t llama_default_buffer_type_cpu(bool host_buffer, bool use_amx) {
     ggml_backend_buffer_type_t buft = nullptr;
+
+#ifdef GGML_USE_AMX
+    // Enable AMX buffer type with tensor_traits compute override
+    // Weights are repacked at model load, tensor->extra points to AMX tensor_traits
+    if (use_amx && !host_buffer) {
+        buft = ggml_backend_amx_buffer_type();
+        if (buft != nullptr) {
+            LLAMA_LOG_INFO("%s: using AMX buffer type\n", __func__);
+            return buft;
+        }
+    }
+#endif
 
 #if defined(GGML_USE_CUDA)
     // host buffers should only be used when data is expected to be copied to/from the GPU
@@ -1801,9 +1888,11 @@ ggml_backend_buffer_type_t llama_default_buffer_type_cpu(bool host_buffer) {
     if (buft == nullptr) {
         buft = ggml_backend_cpu_buffer_type();
     }
+
     return buft;
 
     GGML_UNUSED(host_buffer);
+    GGML_UNUSED(use_amx);
 }
 
 //
@@ -2457,6 +2546,12 @@ struct llama_model {
 
     layer_buft buft_input;
     layer_buft buft_output;
+
+    // Modern buffer list approach (for per-tensor selection)
+    // Each layer has a list of buffer types to try in priority order
+    std::vector<buft_list_t> buft_layer_list;
+
+    // Legacy single buffer type per layer (deprecated, kept for compatibility)
     std::vector<layer_buft> buft_layer;
 
     // contexts where the model tensors metadata is stored
@@ -4890,6 +4985,7 @@ static bool llm_load_tensors(
         const float * tensor_split,
         bool use_mlock,
         bool validate_quants,
+        bool use_amx,
         llama_progress_callback progress_callback,
         void * progress_callback_user_data) {
     model.t_start_us = ggml_time_us();
@@ -4904,14 +5000,28 @@ static bool llm_load_tensors(
     const int i_gpu_start = std::max((int) hparams.n_layer - n_gpu_layers, (int) 0);
     bool use_mmap_buffer = true;
 
-    // there is very little benefit to offloading the input layer, so always keep it on the CPU
-    model.buft_input = llama_default_buffer_type_cpu(true);
+    // When --amx is enabled, bypass host buffers (similar to upstream's --no-host)
+    // For GPU operations, we still need host buffers for data transfers
+    bool need_host_buffer = (n_gpu_layers > 0);
+    bool use_extra_bufts = use_amx;  // Enable extra buffer types (AMX)
+    bool no_host = use_amx && (n_gpu_layers == 0);  // Skip host buffer if CPU-only with AMX
+
+    // CRITICAL: AMX buffer should ONLY be used for model weights (buft_layer), NOT for
+    // intermediate F32 tensors like embeddings/layer norms (buft_input/buft_output)
+    // buft_input stores embeddings which are F32, not quantized weights
+    model.buft_input = llama_default_buffer_type_cpu(need_host_buffer, false /* no AMX for F32 */);
 
     model.buft_layer.resize(n_layer);
+    model.buft_layer_list.resize(n_layer);
 
-    // assign cpu layers
+    // assign cpu layers - populate both legacy buft_layer and new buft_layer_list
     for (int i = 0; i < i_gpu_start; ++i) {
-        model.buft_layer[i] = llama_default_buffer_type_cpu(true);
+        // Legacy: single buffer type (kept for compatibility)
+        model.buft_layer[i] = llama_default_buffer_type_cpu(need_host_buffer, false /* don't force AMX */);
+
+        // Modern: buffer list with fallback priority
+        // Priority: AMX (if enabled) → CPU (always fallback)
+        model.buft_layer_list[i] = make_cpu_buft_list(use_extra_bufts, no_host);
     }
 
     if (split_mode == LLAMA_SPLIT_MODE_LAYER) {
@@ -4943,13 +5053,18 @@ static bool llm_load_tensors(
         for (int i = i_gpu_start; i < n_layer; ++i) {
             int layer_gpu = std::upper_bound(splits.begin(), splits.begin() + device_count, float(i - i_gpu_start)/act_gpu_layers) - splits.begin();
             model.buft_layer[i] = llama_default_buffer_type_offload(model, layer_gpu);
+
+            // GPU layers: buffer list is just GPU buffer (no AMX on GPU layers)
+            buft_list_t gpu_list;
+            gpu_list.push_back(llama_default_buffer_type_offload(model, layer_gpu));
+            model.buft_layer_list[i] = gpu_list;
         }
         // assign the output layer
         if (n_gpu_layers > n_layer) {
             int layer_gpu = std::upper_bound(splits.begin(), splits.begin() + device_count, float(act_gpu_layers - 1)/act_gpu_layers) - splits.begin();
             model.buft_output = llama_default_buffer_type_offload(model, layer_gpu);
         } else {
-            model.buft_output = llama_default_buffer_type_cpu(true);
+            model.buft_output = llama_default_buffer_type_cpu(need_host_buffer, false /* no AMX for F32 */);
         }
     } else {
         ggml_backend_buffer_type_t split_buft;
@@ -4965,6 +5080,11 @@ static bool llm_load_tensors(
                 split_buft,
                 llama_default_buffer_type_offload(model, main_gpu)
             };
+
+            // GPU layers: buffer list is just GPU buffer (no AMX on GPU layers)
+            buft_list_t gpu_list;
+            gpu_list.push_back(split_buft);
+            model.buft_layer_list[i] = gpu_list;
         }
         // assign the output layer
         if (n_gpu_layers > n_layer) {
@@ -4973,7 +5093,7 @@ static bool llm_load_tensors(
                 llama_default_buffer_type_offload(model, main_gpu)
             };
         } else {
-            model.buft_output = llama_default_buffer_type_cpu(true);
+            model.buft_output = llama_default_buffer_type_cpu(need_host_buffer, false /* no AMX for F32 */);
         }
     }
 
@@ -4983,9 +5103,26 @@ static bool llm_load_tensors(
     buft_layer_count[model.buft_input.buft_matrix]++;
     buft_layer_count[model.buft_output.buft]++;
     buft_layer_count[model.buft_output.buft_matrix]++;
+
+    // Count buffer types from legacy buft_layer
     for (int i = 0; i < n_layer; ++i) {
         buft_layer_count[model.buft_layer[i].buft]++;
         buft_layer_count[model.buft_layer[i].buft_matrix]++;
+    }
+
+    // ALSO count buffer types from buffer lists (for per-tensor selection)
+    // Only count unique buffer types to avoid duplicates
+    std::set<ggml_backend_buffer_type_t> unique_bufts;
+    for (int i = 0; i < n_layer; ++i) {
+        for (auto buft : model.buft_layer_list[i]) {
+            unique_bufts.insert(buft);
+        }
+    }
+    for (auto buft : unique_bufts) {
+        // Only add if not already counted (avoid duplicate contexts)
+        if (buft_layer_count.find(buft) == buft_layer_count.end()) {
+            buft_layer_count[buft] = 1;  // Add with count of 1
+        }
     }
 
     // create one context per buffer type
@@ -5062,22 +5199,86 @@ static bool llm_load_tensors(
         ggml_context * ctx_output       = ctx_map.at(model.buft_output.buft);
         ggml_context * ctx_output_split = ctx_map.at(model.buft_output.buft_matrix);
 
+        // Helper to get context for a specific layer
+        // Returns context for the primary buffer type (kept for compatibility)
         auto ctx_for_layer       = [&](int i) { return ctx_map.at(model.buft_layer[i].buft); };
         auto ctx_for_layer_split = [&](int i) { return ctx_map.at(model.buft_layer[i].buft_matrix); };
 
+        // Helper to select buffer type for a tensor from layer's buffer list
+        auto select_layer_buft = [&model, &ml](int layer_idx, const std::string & tensor_name) -> ggml_backend_buffer_type_t {
+            const buft_list_t & buft_list = model.buft_layer_list[layer_idx];
+            if (buft_list.empty()) {
+                return model.buft_layer[layer_idx].buft;  // Fallback to legacy
+            }
+
+            // Get tensor metadata to determine compatibility
+            struct ggml_tensor * temp_tensor = ml.get_tensor_meta(tensor_name.c_str());
+            if (temp_tensor) {
+                // Select first compatible buffer type from list
+                ggml_backend_buffer_type_t selected = select_weight_buft(temp_tensor, GGML_OP_MUL_MAT, buft_list);
+                if (selected) {
+                    return selected;
+                }
+            }
+
+            // Fallback to first in list
+            return buft_list[0];
+        };
+
         model.layers.resize(n_layer);
 
-        auto create_tensor = [&ml, &ctx_map, &ctx_for_buft] (ggml_context * ctx, const std::string & name, const std::vector<int64_t> & ne, int flags = 0) {
+        // Smart tensor creation with automatic per-tensor buffer selection
+        // Automatically detects layer tensors and selects optimal buffer type from layer's buffer list
+        auto create_tensor = [&model, &ml, &ctx_map, &ctx_for_buft, &select_layer_buft] (ggml_context * ctx, const std::string & name, const std::vector<int64_t> & ne, int flags = 0) {
+            // Check for buffer type overrides first
             if (ml.tensor_buft_overrides) {
                 for (const auto * overrides = ml.tensor_buft_overrides; overrides->pattern != nullptr; ++overrides) {
                     std::regex pattern(overrides->pattern);
                     if (std::regex_search(name, pattern)) {
-                        LLAMA_LOG_INFO("Tensor %s buffer type overriden to %s\n", name.c_str(), ggml_backend_buft_name(overrides->buft));
+                        LLAMA_LOG_INFO("Tensor %s buffer type overridden to %s\n", name.c_str(), ggml_backend_buft_name(overrides->buft));
                         ctx = ctx_for_buft(overrides->buft);
+                        return ml.create_tensor(ctx, name, ne, flags);
+                    }
+                }
+            }
+
+            // Try to extract layer index from tensor name (e.g., "blk.5.attn_q.weight" -> layer 5)
+            // This enables automatic per-tensor buffer selection for layer tensors
+            std::regex layer_pattern(R"(blk\.(\d+)\.)");
+            std::smatch match;
+            if (std::regex_search(name, match, layer_pattern)) {
+                int layer_idx = std::stoi(match[1].str());
+                if (layer_idx >= 0 && layer_idx < (int)model.buft_layer_list.size()) {
+                    // This is a layer tensor - use per-tensor buffer selection
+                    ggml_backend_buffer_type_t selected_buft = select_layer_buft(layer_idx, name);
+                    ctx = ctx_for_buft(selected_buft);
+                }
+            }
+
+            return ml.create_tensor(ctx, name, ne, flags);
+        };
+
+        // Create tensor for a specific layer with automatic buffer type selection
+        // This enables AMX (or other specialized buffers) to be used selectively for compatible tensors
+        auto create_tensor_for_layer = [&model, &ml, &ctx_for_buft, &select_layer_buft] (int layer_idx, const std::string & name, const std::vector<int64_t> & ne, int flags = 0) {
+            // Select appropriate buffer type for this tensor based on layer's buffer list
+            ggml_backend_buffer_type_t selected_buft = select_layer_buft(layer_idx, name);
+
+            // Get or create context for selected buffer type
+            ggml_context * ctx = ctx_for_buft(selected_buft);
+
+            // Check for buffer type overrides
+            if (ml.tensor_buft_overrides) {
+                for (const auto * overrides = ml.tensor_buft_overrides; overrides->pattern != nullptr; ++overrides) {
+                    std::regex pattern(overrides->pattern);
+                    if (std::regex_search(name, pattern)) {
+                        ctx = ctx_for_buft(overrides->buft);
+                        LLAMA_LOG_INFO("Tensor %s buffer type overridden to %s\n", name.c_str(), ggml_backend_buft_name(overrides->buft));
                         break;
                     }
                 }
             }
+
             return ml.create_tensor(ctx, name, ne, flags);
         };
 
@@ -7340,7 +7541,14 @@ static bool llm_load_tensors(
         // only the mmap region containing the tensors in the model is mapped to the backend buffer
         // this is important for metal with apple silicon: if the entire model could be mapped to a metal buffer, then we could just use metal for all layers
         // this allows using partial offloading when the model size exceeds the metal buffer size, but not the RAM size
-        if (ml.use_mmap && use_mmap_buffer && (buft == llama_default_buffer_type_cpu(true) || buft == ggml_backend_cpu_buffer_type())) {
+        // Only use mmap for standard CPU buffer types, not for special buffer types like AMX repack
+        bool is_standard_cpu_buft = (buft == ggml_backend_cpu_buffer_type());
+#ifdef GGML_USE_CPU_HBM
+        is_standard_cpu_buft = is_standard_cpu_buft || (buft == ggml_backend_cpu_hbm_buffer_type());
+#endif
+
+        if (ml.use_mmap && use_mmap_buffer && is_standard_cpu_buft) {
+            LLAMA_LOG_INFO("%s: using mmap for buffer type: %s\n", __func__, ggml_backend_buft_name(buft));
             for (uint32_t idx = 0; idx < ml.files.size(); idx++) {
                 void * addr = nullptr;
                 size_t first, last;
@@ -7399,14 +7607,17 @@ static bool llm_load_tensors(
             }
         }
 
+        // Note: We still add contexts with empty bufs to ctx_bufs to maintain proper indexing
+        // This can happen when tensors are distributed across multiple buffer types (AMX, CUDA_HOST, CPU)
         if (bufs.empty()) {
-            throw std::runtime_error("failed to allocate buffer");
-        }
-
-        for (auto & buf : bufs) {
-            // indicate that this buffer contains weights
-            // this is used by ggml_backend_sched to improve op scheduling -> ops that use a weight are preferably scheduled to the backend that contains the weight
-            ggml_backend_buffer_set_usage(buf.second, GGML_BACKEND_BUFFER_USAGE_WEIGHTS);
+            LLAMA_LOG_INFO("%s: context for buffer type %s has no tensors (expected when using multiple buffer types)\n",
+                          __func__, ggml_backend_buft_name(buft));
+        } else {
+            for (auto & buf : bufs) {
+                // indicate that this buffer contains weights
+                // this is used by ggml_backend_sched to improve op scheduling -> ops that use a weight are preferably scheduled to the backend that contains the weight
+                ggml_backend_buffer_set_usage(buf.second, GGML_BACKEND_BUFFER_USAGE_WEIGHTS);
+            }
         }
 
         ctx_bufs.emplace_back(ctx, bufs);
@@ -7579,7 +7790,7 @@ static int llama_model_load(const std::string & fname, llama_model & model, llam
 
         if (!llm_load_tensors(
             ml, model, params.n_gpu_layers, params.mla, params.split_mode,  params.main_gpu, params.tensor_split,
-            params.use_mlock, params.validate_quants,
+            params.use_mlock, params.validate_quants, params.use_amx,
             params.progress_callback, params.progress_callback_user_data
         )) {
             return -2;

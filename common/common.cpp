@@ -2532,34 +2532,9 @@ std::string fs_get_cache_file(const std::string & filename) {
 // Model utils
 //
 
-// Forward-declare AMX functions from ggml library (with C linkage)
-extern "C" {
-    void ggml_amx_set_enabled(bool enabled);
-    #if defined(__AMX_INT8__) && defined(__AVX512VNNI__)
-    bool ggml_amx_int8_init(void);
-    #endif
-    #if defined(__AMX_BF16__)
-    bool ggml_amx_bf16_init(void);
-    #endif
-}
-
 struct llama_init_result llama_init_from_gpt_params(gpt_params & params) {
-    // Enable/disable AMX based on --amx flag
-    if (params.use_amx) {
-        ggml_amx_set_enabled(true);
-        #if defined(__AMX_INT8__) && defined(__AVX512VNNI__)
-        if (!ggml_amx_int8_init()) {
-            fprintf(stderr, "Warning: AMX-INT8 initialization failed\n");
-        }
-        #endif
-        #if defined(__AMX_BF16__)
-        if (!ggml_amx_bf16_init()) {
-            fprintf(stderr, "Warning: AMX-BF16 initialization failed\n");
-        }
-        #endif
-    } else {
-        ggml_amx_set_enabled(false);
-    }
+    // Note: AMX is now enabled via buffer type selection in llama.cpp
+    // The params.use_amx flag is passed through mparams and handled by the model loader
 
     llama_init_result iparams;
     auto mparams = llama_model_params_from_gpt_params(params);
@@ -2705,6 +2680,7 @@ struct llama_model_params llama_model_params_from_gpt_params(const gpt_params & 
     mparams.repack_tensors  = params.repack_tensors;
     mparams.use_thp         = params.use_thp;
     mparams.validate_quants = params.validate_quants;
+    mparams.use_amx         = params.use_amx;
     if (params.kv_overrides.empty()) {
         mparams.kv_overrides = NULL;
     } else {

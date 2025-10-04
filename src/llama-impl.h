@@ -218,4 +218,4 @@ struct no_init {
 struct gguf_context;
 std::string gguf_kv_to_str(const gguf_context * ctx_gguf, int i);
 
-ggml_backend_buffer_type_t llama_default_buffer_type_cpu(bool host_buffer);
+ggml_backend_buffer_type_t llama_default_buffer_type_cpu(bool host_buffer, bool use_amx = false);

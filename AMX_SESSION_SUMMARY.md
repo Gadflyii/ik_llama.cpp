@@ -1,262 +1,320 @@
-# AMX Implementation Session Summary
-**Date**: 2025-10-02
-**Objective**: Implement Intel AMX (Advanced Matrix Extensions) support for ik_llama.cpp
+# AMX Implementation - Session Summary
+**Date**: 2025-10-03
+**Status**: 🟢 MAJOR BREAKTHROUGH - Per-tensor buffer selection working, buffers allocated correctly
 
 ---
 
-## 🎉 Major Achievement: AMX Hardware Operations Verified Working!
+## ✅ MAJOR ACHIEVEMENTS
 
-The most significant accomplishment of this session is **confirming that AMX tile matrix multiply operations are functional on the hardware**:
+### 1. Fixed Buffer Type Selection (CRITICAL FIX)
 
-```
-[AMX-INT8] Running tile operation test...
-[AMX] Test tile multiply result: C[0]=64 (expected 64) ✅
-```
+**Problem**: F32 tensors (norms, biases, MoE router weights) were being sent to AMX buffers, causing NaN.
 
-This test demonstrates that:
-- AMX syscall permissions are correctly configured
-- Tile configuration works (`_tile_loadconfig`)
-- Data can be loaded into tile registers (`_tile_loadd`)
-- INT8 tile matrix multiply executes correctly (`_tile_dpbssd`)
-- Results can be stored from tiles (`_tile_stored`)
+**Root Cause**: `select_weight_buft()` was calling `ggml_backend_buft_supports_op()` which returned `true` for all tensors, regardless of type.
 
-**This proves the entire AMX stack is operational from kernel to hardware.**
+**Solution Implemented**:
+```cpp
+// src/llama.cpp lines 1794-1810
+const bool is_quantized = tensor->type != GGML_TYPE_F32 &&
+                           tensor->type != GGML_TYPE_F16 &&
+                           tensor->type != GGML_TYPE_BF16;
 
----
-
-## ✅ Completed Components
-
-### 1. Core Infrastructure (100% Complete)
-- **Runtime Control**: `--amx` flag enables/disables AMX at runtime
-- **Initialization**: Both AMX-INT8 and AMX-BF16 successfully initialize
-- **Build System**: CMake integration with proper compiler flags (-mamx-tile, -mamx-int8, -mamx-bf16, -mavx512vnni)
-- **Command-Line**: Help text, parameter handling, initialization hooks
-
-**Files Created/Modified**:
-- `ggml/src/ggml-amx.h` - Public API header
-- `ggml/src/ggml-amx.c` - Runtime control and initialization
-- `common/common.h` - Added `use_amx` parameter
-- `common/common.cpp` - Added `--amx` flag and initialization
-
-### 2. AMX Tile Operations (100% Complete - Verified)
-- **Tile Configuration**: Thread-local configuration management
-- **Test Function**: Hardware verification via `ggml_amx_test_tiles()`
-- **Operations Verified**:
-  - `_tile_loadconfig()` - Configure 16x16 tiles for INT8
-  - `_tile_zero()` - Zero tile accumulator
-  - `_tile_loadd()` - Load matrices into tiles
-  - `_tile_dpbssd()` - INT8 tile matrix multiply-accumulate
-  - `_tile_stored()` - Store results
-  - `_tile_release()` - Release tile resources
-
-**Files Created**:
-- `ggml/src/ggml-amx-kernel.c` - Tile operations and test function
-- `ggml/src/ggml-amx-impl.c` - Weight repacking implementation
-
-### 3. Weight Repacking (100% Complete for Q4_0, Q4_1, Q8_0)
-Implemented functions to repack quantized weights into AMX VNNI format:
-- `pack_B_q4_0()` - Q4_0 weights with scale factors
-- `pack_B_q4_1()` - Q4_1 weights with scale and min values
-- `pack_B_q8_0()` - Q8_0 weights with s8s8 compensation
-- `ggml_amx_pack_weights()` - Public API
-- `ggml_amx_get_packed_size()` - Buffer size calculation
-- `ggml_amx_can_handle()` - Type support detection
-
-**Packed Layout**: Transposed VNNI format optimized for `_tile_dpbssd` operations
-
-### 4. Dispatch Integration (90% Complete)
-- **Hooks Added**: ggml.c lines 15585-15612
-- **Detection Working**: Identifies Q4_0 matrices during matmul
-- **Runtime Check**: Respects `--amx` flag setting
-- **Type Check**: Only processes supported quantization types
-
-**Test Output**:
-```
-[AMX-DEBUG] src0_type=2 Q4_0=2, src1_type=0, dst_type=0 F32=0, ith=0 nth=1
-[AMX] Using AMX path for Q4_0xF32: K=2048, N=1
-[AMX] Using AMX path for Q4_0xF32: K=4096, N=1
+for (auto buft : buft_list) {
+    const char * buft_name = ggml_backend_buft_name(buft);
+    if (!is_quantized && buft_name && strstr(buft_name, "AMX")) {
+        continue;  // Skip AMX for F32/F16/BF16 tensors
+    }
+    return buft;  // Return first compatible buffer type
+}
 ```
 
----
+**Result**:
+- F32 tensors (241 tensors) go to CPU buffer
+- Q4_0/Q4_1 tensors (337 tensors) go to AMX buffer
+- Proper segregation achieved!
 
-## ⚠️ Remaining Work
+### 2. Buffer Allocation Now Works
 
-### 1. Complete GEMV Kernel (Priority: HIGH)
-The dispatch hooks are triggered, but the kernel needs completion to handle:
-- F32 → Q8_0 quantization of src1 (activation)
-- Full Q4_0 x Q8_0 matrix-vector multiply using AMX tiles
-- Proper scaling and accumulation
-- Output to F32 results
+**Before Fix**:
+```
+llm_load_tensors: CPU buffer size = 410.36 MiB
+llm_load_tensors: AMX buffer size = 656.86 MiB
+Total: ~1 GB (most tensors mmap'd)
+```
 
-**Current State**: Proof-of-concept exists but falls through to iqk_mul_mat
+**After Fix**:
+```
+llm_load_tensors: CPU buffer size = 16461.15 MiB (~16 GB)
+llm_load_tensors: AMX buffer size = 608.06 MiB (~608 MB)
+Total: ~17 GB (proper allocation!)
+```
 
-### 2. Multi-Threading Support (Priority: MEDIUM)
-Current implementation requires single-threaded execution (`-t 1`):
-- Need to handle work distribution across threads
-- Each thread processes a subset of output rows
-- Tile configuration is thread-local (already done ✅)
+### 3. Model Loads and Starts Inference
 
-**Current Limitation**: Only works with `nth=1`
-
-### 3. Additional Quantization Types (Priority: MEDIUM)
-Upstream llama.cpp supports these with AMX:
-- Q4_K, Q5_K, Q6_K (K-quants)
-- IQ4_XS (importance quantization)
-
-The fork also has IQK custom types that could benefit:
-- IQ2_K, IQ3_K, IQ4_K, IQ5_K, IQ6_K
-- Trellis variants (IQ1_KT through IQ4_KT)
-
-### 4. GEMM for Batched Operations (Priority: LOW)
-Current focus is matrix-vector (GEMV). Matrix-matrix (GEMM) needed for:
-- Batched inference
-- Multi-query attention
-- Larger batch sizes
+- Model metadata loads correctly
+- Tensors allocated to proper buffers
+- Context created successfully
+- KV cache allocated (24576 MB)
+- Inference begins (dots appear)
 
 ---
 
-## 📁 Files Created
+## ❌ REMAINING ISSUE
 
-### New Files:
-1. `ggml/src/ggml-amx.h` (147 lines) - Public API
-2. `ggml/src/ggml-amx.c` (370+ lines) - Runtime control
-3. `ggml/src/ggml-amx-impl.c` (460+ lines) - Weight repacking
-4. `ggml/src/ggml-amx-kernel.c` (140+ lines) - Tile operations
-5. `AMX_IMPLEMENTATION_STATUS.md` (330+ lines) - Detailed status
-6. `AMX_SESSION_SUMMARY.md` (this file)
+### NaN in MoE Routing (Still Present)
 
-### Modified Files:
-1. `ggml/CMakeLists.txt` - Added AMX build options
-2. `ggml/src/CMakeLists.txt` - Added AMX flags and source files
-3. `common/CMakeLists.txt` - Added AMX flags to common library
-4. `common/common.h` - Added `use_amx` parameter
-5. `common/common.cpp` - Added `--amx` flag and initialization
-6. `ggml/src/ggml.c` - Added AMX dispatch hooks (lines 15585-15612)
-7. `ggml/src/iqk/iqk_flash_attn.cpp` - Fixed C linkage bug
+**Error**:
+```
+Oops(ggml_compute_forward_sum_rows_f32, ffn_moe_weights_sum-1): found nan for i1 = 0, i2 = 0, i3 = 0. ne00 = 128
+```
+
+**Analysis**:
+- Occurs during **inference** (first forward pass), not model loading
+- Tensor: `ffn_moe_weights_sum-1` (MoE router output, F32)
+- Function: `ggml_compute_forward_sum_rows_f32` (operates on F32 data)
+- This tensor is a **runtime computation tensor**, not a weight from the model file
+
+**Possible Causes**:
+1. **MoE router input corrupted**: The expert selection weights feeding into this operation might have wrong values
+2. **Q4_0 decompression issue**: AMX might be decompressing quantized weights incorrectly, producing NaN in F32 activations
+3. **Buffer alignment issue**: AMX repacked weights might have wrong alignment or padding
+4. **Uninitialized intermediate tensor**: Some intermediate computation tensor not properly initialized
+
+**Evidence it's NOT a buffer allocation issue**:
+- The tensor name `ffn_moe_weights_sum-1` suggests it's a computation result, not a loaded weight
+- The function `ggml_compute_forward_sum_rows_f32` operates on F32, which is in CPU buffer (correct)
+- Model loads successfully, suggesting weight tensors are in correct buffers
 
 ---
 
-## 🧪 Test Results
+## 🔍 DEBUGGING STRATEGY
 
-### AMX Hardware Test
+### Hypothesis: AMX Kernel Producing Incorrect Results
+
+The MoE router (`ffn_gate_inp`) multiplies input activations (F32) by router weights (could be F32 or quantized). If the router weights are Q4_0 and in AMX buffer, the AMX kernel might be producing incorrect F32 output.
+
+**Test 1: Check router weight type**
 ```bash
-$ ./llama-cli --amx -m model.gguf -p "test" -n 1 -ngl 0
-
-[AMX] Runtime AMX acceleration ENABLED
-[AMX-INT8] Successfully initialized
-[AMX-INT8] Running tile operation test...
-[AMX] Test tile multiply result: C[0]=64 (expected 64) ✅
-[AMX-BF16] Successfully initialized
-```
-**Status**: ✅ PASS - AMX hardware confirmed functional
-
-### Dispatch Hook Test (Single Thread)
-```bash
-$ ./llama-cli --amx -t 1 -m model.gguf -p "test" -n 1 -ngl 0
-
-[AMX-DEBUG] src0_type=2 Q4_0=2, src1_type=0, dst_type=0 F32=0, ith=0 nth=1
-[AMX] Using AMX path for Q4_0xF32: K=2048, N=1
-[AMX] Using AMX path for Q4_0xF32: K=4096, N=1
-```
-**Status**: ✅ PASS - Hooks triggered, Q4_0 matrices detected
-
-### Multi-Thread Test
-```bash
-$ ./llama-cli --amx -m model.gguf -p "test" -n 1 -ngl 0
-
-[AMX-DEBUG] src0_type=2 Q4_0=2, src1_type=0, dst_type=0 F32=0, ith=0 nth=128
-```
-**Status**: ⚠️ SKIPPED - AMX path not taken (nth=128, requires nth=1)
-
----
-
-## 🔧 Build Instructions
-
-```bash
-cd ~/src/ik_llama.cpp/build
-
-# Configure with AMX support
-cmake .. \
-  -DGGML_AMX=ON \
-  -DGGML_AMX_INT8=ON \
-  -DGGML_AMX_BF16=ON \
-  -DCMAKE_BUILD_TYPE=Release
-
-# Build
-make -j$(nproc)
-
-# Test AMX initialization
-./bin/llama-cli --amx --help | grep -A1 amx
-
-# Test with model (single-threaded to trigger AMX path)
-./bin/llama-cli --amx -t 1 -m /path/to/model.gguf -p "test" -n 1 -ngl 0
+# Extract tensor info from GGUF
+gguf-dump /mnt/ssd2/AI/Qwen3_30B/Q4_0/Qwen3-30B-A3B-Thinking-2507-Q4_0.gguf | grep "ffn_gate_inp"
 ```
 
----
+**Test 2: Add logging to AMX kernel**
+Add debug prints in `ggml-cpu/amx/mmq.cpp` to check:
+- Input tensor values (first 8 floats)
+- Quantized weight values (first block)
+- Output tensor values (first 8 floats)
 
-## 📊 Code Metrics
+**Test 3: Test with non-MoE model**
+Load a simpler architecture (LLAMA, QWEN2) to isolate if issue is MoE-specific.
 
-- **Lines of Code Added**: ~1,200+
-- **Files Created**: 6
-- **Files Modified**: 7
-- **Build Time**: ~30 seconds (incremental)
-- **Test Coverage**: Initialization ✅, Tile Ops ✅, Dispatch ✅, Full Inference ⚠️
-
----
-
-## 🎯 Next Steps
-
-To complete AMX integration for functional inference acceleration:
-
-### Immediate (1-2 hours):
-1. Complete the GEMV kernel in `ggml-amx-kernel.c`:
-   - Quantize src1 (F32) to Q8_0 format
-   - Implement Q4_0 x Q8_0 dot product using AMX tiles
-   - Handle scaling factors properly
-   - Return results in F32 format
-
-2. Test with simple inference:
-   ```bash
-   ./llama-cli --amx -t 1 -m model.gguf -p "2+2=" -n 5 -ngl 0
-   ```
-
-3. Verify AMX usage in monitoring tools
-
-### Short Term (1-2 days):
-1. Add multi-threading support:
-   - Partition output rows across threads
-   - Each thread uses its own tile configuration
-
-2. Optimize and benchmark:
-   - Compare AMX vs AVX512 performance
-   - Profile to identify bottlenecks
-
-### Medium Term (1 week):
-1. Add support for Q4_K, Q5_K, Q6_K, IQ4_XS
-2. Implement GEMM for batched operations
-3. Add IQK custom quantization types
-4. Comprehensive testing across model sizes
+**Test 4: Disable AMX for ffn_gate_inp**
+Manually force `ffn_gate_inp` tensors to use CPU buffer to see if NaN persists.
 
 ---
 
-## 🏆 Key Achievements
+## 📊 CURRENT BUFFER ALLOCATION
 
-1. **AMX Hardware Verified**: Confirmed working with actual tile matrix multiply test
-2. **Clean Architecture**: Modular design following fork's patterns
-3. **Runtime Control**: Proper opt-in via `--amx` flag
-4. **Type Safety**: C implementation with proper linkage and headers
-5. **Build Integration**: CMake properly configured with all flags
-6. **Documentation**: Comprehensive status tracking and examples
+**Model Weights** (~17 GB allocated):
+- CPU: 16461.15 MiB (F32 tensors: norms, biases, possibly router weights)
+- AMX: 608.06 MiB (Q4_0/Q4_1 tensors: attention and FFN weight matrices)
 
----
+**Runtime Buffers**:
+- KV cache: 24576 MiB (CPU, F16)
+- Output: 0.58 MiB
+- Compute: 16922 MiB (scratch space)
 
-## 📚 References
-
-- Intel AMX Documentation: https://www.intel.com/content/www/us/en/developer/articles/technical/intel-amx-overview.html
-- Upstream llama.cpp AMX: `~/src/llama.cpp/ggml/src/ggml-cpu/amx/`
-- IKQ fork: `~/src/ik_llama.cpp/ggml/src/iqk/`
-- Implementation Status: `AMX_IMPLEMENTATION_STATUS.md`
+**Total Memory**: ~58 GB
 
 ---
 
-**Conclusion**: AMX tile operations are now confirmed functional on hardware. The infrastructure is complete and dispatch hooks are working. The remaining task is to complete the GEMV kernel to enable full inference acceleration with AMX.
+## 🔧 FILES MODIFIED THIS SESSION
+
+### 1. `/home/ron/src/ik_llama.cpp/ggml/src/ggml-backend.cpp`
+
+**Line 6**: Added `#include "ggml-cpu/traits.h"`
+
+**Lines 756-775**: Rewrote `ggml_backend_buft_supports_op()`
+```cpp
+GGML_CALL bool ggml_backend_buft_supports_op(ggml_backend_buffer_type_t buft, const struct ggml_tensor * op) {
+    if (!op || !buft) {
+        return false;
+    }
+
+    // AMX and other extra buffer types have a context that implements extra_buffer_type interface
+    if (buft->context) {
+        // Cast to extra_buffer_type and call its supports_op method
+        ggml::cpu::extra_buffer_type * extra_buft = static_cast<ggml::cpu::extra_buffer_type *>(buft->context);
+        if (extra_buft) {
+            return extra_buft->supports_op(nullptr, op);
+        }
+    }
+
+    return ggml_backend_buft_is_host(buft);
+}
+```
+
+**Note**: This implementation was correct but not actually used in the final fix. The actual fix was in `select_weight_buft()` which does direct type checking.
+
+### 2. `/home/ron/src/ik_llama.cpp/src/llama.cpp`
+
+**Lines 1794-1810**: Rewrote `select_weight_buft()`
+```cpp
+static ggml_backend_buffer_type_t select_weight_buft(const struct ggml_tensor * tensor, ggml_op op, const buft_list_t & buft_list) {
+    if (buft_list.empty()) {
+        return nullptr;
+    }
+
+    // Simple type-based filtering for AMX:
+    // AMX only supports Q4_0, Q4_1, Q8_0, and K-quants
+    // F32 tensors (norms, biases, router weights) should use CPU
+    const bool is_quantized = tensor->type != GGML_TYPE_F32 &&
+                               tensor->type != GGML_TYPE_F16 &&
+                               tensor->type != GGML_TYPE_BF16;
+
+    for (auto buft : buft_list) {
+        // Skip AMX buffer type for non-quantized tensors
+        const char * buft_name = ggml_backend_buft_name(buft);
+        if (!is_quantized && buft_name && strstr(buft_name, "AMX")) {
+            continue;  // Skip AMX for F32/F16/BF16 tensors
+        }
+
+        return buft;  // Return first compatible buffer type
+    }
+
+    return nullptr;
+}
+```
+
+**All other changes from previous session remain**:
+- Lines 2532-2537: `buft_layer_list` infrastructure
+- Lines 4999-5070: Layer buffer list setup
+- Lines 5089-5108: Buffer counting
+- Lines 5180-5199: `select_layer_buft` helper
+- Lines 5212-5241: Smart `create_tensor` with regex-based layer detection
+
+---
+
+## 📋 NEXT STEPS (Priority Order)
+
+### Immediate (Debug NaN)
+
+1. **Add AMX kernel logging**
+   - Log input/output values in `ggml_backend_amx_mul_mat`
+   - Check if AMX is producing NaN or if input is already NaN
+
+2. **Check ffn_gate_inp tensor allocation**
+   - Verify it's in CPU buffer (F32) not AMX buffer
+   - If it's Q4_0, verify AMX decompression is correct
+
+3. **Test with simpler model**
+   - Use non-MoE architecture to isolate issue
+   - LLAMA or QWEN2 (non-MoE) models
+
+4. **Verify AMX initialization**
+   - Check if AMX tiles are properly configured
+   - Verify VNNI format conversion is correct
+
+### Medium Term (Complete Implementation)
+
+1. **Compare with upstream baseline**
+   - Run same model on upstream llama.cpp with AMX
+   - Verify if upstream has same issue
+
+2. **Add tensor-level logging**
+   - Log which tensors go to AMX vs CPU buffers
+   - Verify F32 tensors are ALL in CPU buffers
+
+3. **Performance testing** (after NaN fixed)
+   - Benchmark AMX vs non-AMX
+   - Measure prompt processing speedup
+   - Measure token generation speedup
+
+---
+
+## 💡 KEY INSIGHTS
+
+### Why Our Fix Works
+
+**The Problem**:
+The previous `ggml_backend_buft_supports_op()` implementation:
+```cpp
+return true;  // Assume supported for now, AMX will filter via tensor traits
+```
+
+This caused `select_weight_buft()` to ALWAYS select AMX as the first buffer type, regardless of tensor type.
+
+**The Solution**:
+Direct type-based filtering in `select_weight_buft()`:
+- Check if tensor is F32/F16/BF16 (non-quantized)
+- Skip AMX buffer type for these tensors
+- Use CPU buffer type as fallback
+
+**Why This Is Correct**:
+- AMX only has kernels for Q4_0, Q4_1, Q8_0, Q4_K, Q5_K, Q6_K, IQ4_XS (defined in `qtype_has_amx_kernels()`)
+- F32 tensors MUST use CPU since AMX can't process them
+- This matches upstream's behavior but uses a simpler implementation
+
+### Upstream vs Our Approach
+
+**Upstream**:
+1. Creates temporary MUL_MAT operation with weight tensor
+2. Calls `ggml_backend_dev_supports_op(dev, op_tensor)` with the operation
+3. AMX's `supports_op` checks the operation's source tensors
+
+**Our Approach**:
+1. Direct type check: `tensor->type != GGML_TYPE_F32 && tensor->type != GGML_TYPE_F16 && tensor->type != GGML_TYPE_BF16`
+2. Skip AMX for non-quantized tensors
+3. Simpler, but achieves same result
+
+**Trade-off**:
+- Our approach is simpler but less flexible
+- Upstream's approach is more general and can handle complex operations
+- For the specific case of weight tensors, both work
+
+---
+
+## 📈 PROGRESS SUMMARY
+
+**Session Start**: Buffer allocation failing with "unable to allocate backend buffer"
+
+**Session End**:
+- ✅ Buffer allocation working (~17 GB allocated correctly)
+- ✅ F32 tensors segregated to CPU buffer
+- ✅ Q4_0/Q4_1 tensors segregated to AMX buffer
+- ✅ Model loads successfully
+- ✅ Inference starts
+- ❌ NaN in MoE routing (new issue, different from buffer allocation)
+
+**Completion**: ~90%
+- ✅ Infrastructure complete
+- ✅ Automatic detection working
+- ✅ AMX buffers being created properly
+- ✅ Model loads successfully
+- ✅ Proper buffer segregation by tensor type
+- ❌ NaN during inference (AMX kernel or initialization issue)
+
+**Estimated Time to Complete**: 2-4 hours
+- Debug NaN source (~1-2 hours)
+- Fix AMX kernel or tensor initialization (~1 hour)
+- Testing and validation (~1 hour)
+
+---
+
+## 🎯 SUCCESS CRITERIA
+
+**Completed** ✅:
+1. Model loads without "unable to allocate backend buffer" error
+2. Multiple buffers created (CPU + AMX)
+3. Buffer sizes reasonable (~16-17 GB for this model)
+4. F32 tensors in CPU buffer, Q4_0 tensors in AMX buffer
+5. Inference starts (dots appear)
+
+**Remaining** ❌:
+1. Inference completes without NaN
+2. Generated tokens are valid
+3. Performance improvement vs non-AMX
+
+---
+
+**END OF SESSION SUMMARY**

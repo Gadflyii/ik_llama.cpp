@@ -17,7 +17,9 @@
 #include "iqk/iqk_config.h"
 #endif
 #ifdef GGML_USE_AMX
-#include "ggml-amx.h"
+// AMX is now implemented in ggml-cpu/amx/ (upstream pattern)
+// No includes needed here - dispatch happens via tensor->extra (tensor_traits)
+#include "ggml-cpu-traits.h"   // For tensor_traits compute override
 #endif
 
 #if defined(_MSC_VER) || defined(__MINGW32__)
@@ -1557,21 +1559,23 @@ static const ggml_type_traits_t type_traits[GGML_TYPE_COUNT] = {
         .gemm                     = ggml_gemm_q4_0_4x8_q8_0,
         .row_meta_size            = 0,
     },
+    // Note: GGML_TYPE_Q4_0_8_8 was a custom type for old AMX implementation - removed
+    // AMX now works via buffer type + tensor_traits dispatch (see ggml-cpu/amx/)
     [GGML_TYPE_Q4_0_8_8] = {
-        .type_name                = "q4_0_8x8",
-        .blck_size                = QK4_0,
-        .blck_size_interleave     = 8,
-        .type_size                = sizeof(block_q4_0),
-        .is_quantized             = true,
+        .type_name                = "q4_0_8x8_unused",
+        .blck_size                = 0,
+        .blck_size_interleave     = 0,
+        .type_size                = 0,
+        .is_quantized             = false,
         .to_float                 = NULL,
         .from_float               = NULL,
         .from_float_ref           = NULL,
         .vec_dot                  = NULL,
-        .vec_dot_type             = GGML_TYPE_Q8_0,
-        .nrows                    = 1,
-        .ncols                    = 8,
-        .gemv                     = ggml_gemv_q4_0_8x8_q8_0,
-        .gemm                     = ggml_gemm_q4_0_8x8_q8_0,
+        .vec_dot_type             = GGML_TYPE_COUNT,
+        .nrows                    = 0,
+        .ncols                    = 0,
+        .gemv                     = NULL,
+        .gemm                     = NULL,
         .row_meta_size            = 0,
     },
     [GGML_TYPE_IQ2_K] = {
@@ -4421,7 +4425,7 @@ inline static void ggml_critical_section_start(void) {
 }
 
 #ifdef GGML_USE_OPENMP
-static void ggml_barrier(struct ggml_compute_state_shared * shared) {
+static void ggml_barrier_internal(struct ggml_compute_state_shared * shared) {
     if (shared->n_threads == 1) {
         return;
     }
@@ -4429,7 +4433,7 @@ static void ggml_barrier(struct ggml_compute_state_shared * shared) {
     #pragma omp barrier
 }
 #else
-static void ggml_barrier(struct ggml_compute_state_shared * shared) {
+static void ggml_barrier_internal(struct ggml_compute_state_shared * shared) {
     if (shared->n_threads == 1) {
         return;
     }
@@ -4575,6 +4579,46 @@ void ggml_numa_init(enum ggml_numa_strategy numa_flag) {
 
 bool ggml_is_numa(void) {
     return g_state.numa.n_nodes > 1;
+}
+
+// Get the current NUMA strategy (used by AMX code)
+enum ggml_numa_strategy ggml_get_numa_strategy(void) {
+    return g_state.numa.numa_strategy;
+}
+
+// Barrier function for threadpool (used by upstream AMX code)
+// Our ggml.c has internal barriers with compute_state_shared, AMX code expects threadpool-based barrier
+// We cast threadpool* to our compute_state_shared* since they have compatible barrier fields
+void ggml_barrier(struct ggml_threadpool * tp) {
+    // Cast to our internal structure - this works because we ensure compatible layout
+    struct ggml_compute_state_shared * shared = (struct ggml_compute_state_shared *)tp;
+
+    int n_threads = shared->n_threads;
+    if (n_threads == 1) {
+        return;
+    }
+
+    int n_passed = atomic_load(&shared->n_barrier_passed);
+
+    // Enter barrier (full seq-cst fence)
+    int n_barrier = atomic_fetch_add(&shared->n_barrier, 1);
+
+    if (n_barrier == (n_threads - 1)) {
+        // Last thread - reset barrier and signal completion
+        atomic_store(&shared->n_barrier, 0);
+        atomic_fetch_add(&shared->n_barrier_passed, 1);
+        return;
+    }
+
+    // Wait for other threads
+    while (atomic_load(&shared->n_barrier_passed) == n_passed) {
+        // CPU relax/pause
+        #if defined(__x86_64__) || defined(_M_X64)
+            _mm_pause();
+        #elif defined(__aarch64__)
+            __asm__ __volatile__("yield" ::: "memory");
+        #endif
+    }
 }
 
 ////////////////////////////////////////////////////////////////////////////////
@@ -12663,7 +12707,7 @@ static void ggml_compute_forward_acc_f32(
                 ((char *) src0->data),
                 ggml_nbytes(dst));
         }
-        ggml_barrier(params->shared);
+        ggml_barrier_internal(params->shared);
     }
 
     const int ith = params->ith;
@@ -15581,35 +15625,8 @@ static int ggml_compute_forward_mul_mat(
 
     // nb01 >= nb00 - src0 is not transposed
     //   compute by src0 rows
-
-#ifdef GGML_USE_AMX
-    // Try AMX path first if enabled
-    // AMX works best with single-threaded execution for now
-    if (ggml_amx_is_enabled() && ith == 0) {
-        static int debug_count = 0;
-        if (debug_count < 1) {
-            fprintf(stderr, "[AMX-DEBUG] src0_type=%d Q4_0=%d, src1_type=%d, dst_type=%d F32=%d, ith=%d nth=%d\n",
-                   src0->type, GGML_TYPE_Q4_0, src1->type, dst->type, GGML_TYPE_F32, ith, nth);
-            debug_count++;
-        }
-
-        // For multithreading: each thread handles a portion of rows
-        // For now, skip AMX if multi-threaded (will implement parallel version later)
-        if (nth == 1 && ggml_amx_can_handle(src0->type) && dst->type == GGML_TYPE_F32 &&
-            ne02 == 1 && ne03 == 1 && ne12 == 1 && ne13 == 1) {
-            // Single batch case
-            if (src0->type == GGML_TYPE_Q4_0 && src1->type == GGML_TYPE_F32) {
-                static int amx_call_count = 0;
-                if (amx_call_count < 3) {
-                    fprintf(stderr, "[AMX] Using AMX path for Q4_0xF32: K=%ld, N=%ld\n", ne00, ne11);
-                    amx_call_count++;
-                }
-                // Note: src1 will be quantized later, but we can use AMX after quantization
-                // For now, fall through to let iqk_mul_mat handle it
-            }
-        }
-    }
-#endif
+    // Note: AMX dispatch is now handled via tensor->extra (tensor_traits)
+    // See ggml-cpu/amx/ for the new implementation
 
 #if GGML_USE_IQK_MULMAT
     if (ith == 0) {
@@ -15623,7 +15640,14 @@ static int ggml_compute_forward_mul_mat(
 #endif
         }
     }
-    if (dst->type == GGML_TYPE_F32) {
+    // Skip IQK for AMX custom types (Q4_0_8_8, etc.) - use gemm/gemv path instead
+    bool use_iqk = true;
+#ifdef GGML_USE_AMX
+    if (type == GGML_TYPE_Q4_0_8_8) {
+        use_iqk = false;
+    }
+#endif
+    if (use_iqk && dst->type == GGML_TYPE_F32) {
         if (iqk_mul_mat_4d(ne01, ne11, ne00,
                     ne02, ne03, ne12, ne13, nb02, nb03, nb12, nb13, nb2/sizeof(float), nb3/sizeof(float),
                     src0->type, src0->data, nb01,
@@ -15634,6 +15658,20 @@ static int ggml_compute_forward_mul_mat(
 
     if (src1->type != vec_dot_type) {
         char * wdata = params->wdata;
+
+        // Debug for AMX
+        static int quant_debug_count = 0;
+        if (quant_debug_count < 2 && type == GGML_TYPE_Q4_0_8_8) {
+            fprintf(stderr, "[AMX-QUANT] Layer: src0='%s', src1='%s', dst='%s'\n",
+                    src0->name, src1->name, dst->name);
+            fprintf(stderr, "[AMX-QUANT] Quantizing activations: src1->type=%d, vec_dot_type=%d\n",
+                    src1->type, vec_dot_type);
+            fprintf(stderr, "[AMX-QUANT] wdata=%p, wsize=%zu, ne10=%ld, ne11=%ld, ith=%d\n",
+                    (void*)wdata, params->wsize, ne10, ne11, ith);
+            fprintf(stderr, "[AMX-QUANT] from_float=%p, nbw1=%zu\n",
+                    (void*)from_float, ggml_row_size(vec_dot_type, ne10));
+            quant_debug_count++;
+        }
 
 #if IK_PRINT_TIMING
         int64_t t1 = ggml_time_us();
@@ -15670,15 +15708,39 @@ static int ggml_compute_forward_mul_mat(
                     }
 #endif
                     for (int64_t i11 = i11_processed + ith; i11 < ne11; i11 += nth) {
-                        from_float((float *)((char *) src1->data + i13*nb13 + i12*nb12 + i11*nb11),
-                                (void *)               (wdata + i13*nbw3 + i12*nbw2 + i11*nbw1),
-                                ne10);
+                        void * dst_ptr = (void *)(wdata + i13*nbw3 + i12*nbw2 + i11*nbw1);
+                        const float * src_ptr = (float *)((char *) src1->data + i13*nb13 + i12*nb12 + i11*nb11);
+
+                        // Debug first quantization
+                        static int first_quant = 1;
+                        if (first_quant && type == GGML_TYPE_Q4_0_8_8 && i11 == 0) {
+                            fprintf(stderr, "[AMX-QUANT-CALL] src_ptr=%p, dst_ptr=%p, ne10=%ld\n",
+                                    (void*)src_ptr, dst_ptr, ne10);
+                            fprintf(stderr, "[AMX-QUANT-CALL] src[0]=%f, src[1]=%f, src[2]=%f\n",
+                                    src_ptr[0], src_ptr[1], src_ptr[2]);
+                            first_quant = 0;
+                        }
+
+                        from_float(src_ptr, dst_ptr, ne10);
+
+                        // Check result
+                        if (type == GGML_TYPE_Q4_0_8_8 && i11 == 0 && ith == 0) {
+                            static int check_result = 1;
+                            if (check_result) {
+                                const block_q8_0 * result = (const block_q8_0 *)dst_ptr;
+                                fprintf(stderr, "[AMX-QUANT-RESULT] block 0: d=%f\n",
+                                        GGML_FP16_TO_FP32(result[0].d));
+                                fprintf(stderr, "[AMX-QUANT-RESULT] block 0: qs[0]=%d, qs[1]=%d\n",
+                                        result[0].qs[0], result[0].qs[1]);
+                                check_result = 0;
+                            }
+                        }
                     }
                 }
             }
         }
 
-        ggml_barrier(params->shared);
+        ggml_barrier_internal(params->shared);
 
 #if IK_PRINT_TIMING
         int64_t t2 = ggml_time_us();
@@ -15722,7 +15784,7 @@ static int ggml_compute_forward_mul_mat(
     if (ith == 0) {
         atomic_store(&params->shared->current_chunk, nth);
     }
-    ggml_barrier(params->shared);
+    ggml_barrier_internal(params->shared);
 
     // This is the size of the first dimension of the result, so we can iterate that way. (see the ASSERT above, these are the same numbers)
     const int64_t nr0 = ne0;
@@ -15768,6 +15830,16 @@ static int ggml_compute_forward_mul_mat(
     if ((ggml_n_dims(src0) == 2) && gemv) {
         const void * src1_wdata      = (src1->type == vec_dot_type) ? src1->data : params->wdata;
         const size_t src1_col_stride = ggml_is_contiguous(src1) || src1->type != vec_dot_type ? ggml_row_size(vec_dot_type, ne10) : nb11;
+
+        // Debug for AMX
+        static int gemv_dispatch_debug = 0;
+        if (gemv_dispatch_debug < 2 && type == GGML_TYPE_Q4_0_8_8) {
+            fprintf(stderr, "[AMX-DISPATCH] src1_wdata=%p, params->wdata=%p, stride=%zu\n",
+                    src1_wdata, params->wdata, src1_col_stride);
+            fprintf(stderr, "[AMX-DISPATCH] src1->type=%d, vec_dot_type=%d, match=%d\n",
+                    src1->type, vec_dot_type, src1->type == vec_dot_type);
+            gemv_dispatch_debug++;
+        }
         int64_t src0_start = (ith * ne01) / nth;
         int64_t src0_end   = ((ith + 1) * ne01) / nth;
         src0_start = (src0_start % matmul_num_cols) ? src0_start + matmul_num_cols - (src0_start % matmul_num_cols): src0_start;
@@ -15916,7 +15988,7 @@ static void ggml_compute_forward_mul_mat_id(
         }
     }
 
-    ggml_barrier(params->shared);
+    ggml_barrier_internal(params->shared);
 
     // compute each matrix multiplication in sequence
     for (int cur_a = 0; cur_a < n_as; ++cur_a) {
@@ -16186,7 +16258,7 @@ static void ggml_compute_forward_mul_mat_id_up_gate(
         }
     }
 
-    ggml_barrier(params->shared);
+    ggml_barrier_internal(params->shared);
 
 
     // so GGML_TENSOR_BINARY_OP_LOCALS works
@@ -16299,7 +16371,7 @@ static void ggml_compute_forward_mul_mat_up_gate(
         }
     }
 
-    ggml_barrier(params->shared);
+    ggml_barrier_internal(params->shared);
 
     const size_t row_size = ggml_row_size(vec_dot_type, ne10);
 
@@ -16349,7 +16421,7 @@ static void ggml_compute_forward_out_prod_f32(
     if (ith == 0) {
         ggml_vec_set_f32(ne0*ne1*ne2*ne3, dst->data, 0);
     }
-    ggml_barrier(params->shared);
+    ggml_barrier_internal(params->shared);
 
     // dst[:,:,:,:] = 0
     // for i2,i3:
@@ -16467,7 +16539,7 @@ static void ggml_compute_forward_out_prod_q_f32(
     if (ith == 0) {
         ggml_vec_set_f32(ne0*ne1*ne2*ne3, dst->data, 0);
     }
-    ggml_barrier(params->shared);
+    ggml_barrier_internal(params->shared);
 
     // parallelize by last three dimensions
 
@@ -16882,7 +16954,7 @@ static void ggml_compute_forward_set_f32(
                 ((char *) src0->data),
                 ggml_nbytes(dst));
         }
-        ggml_barrier(params->shared);
+        ggml_barrier_internal(params->shared);
     }
 
     const int ith = params->ith;
@@ -17575,7 +17647,7 @@ static void ggml_compute_forward_diag_mask_f32(
                 ((char *) src0->data),
                 ggml_nbytes(dst));
         }
-        ggml_barrier(params->shared);
+        ggml_barrier_internal(params->shared);
     }
 
     // TODO: handle transposed/permuted matrices
@@ -18607,7 +18679,7 @@ static void ggml_compute_forward_conv_transpose_1d_f16_f32(
         // need to zero dst since we are accumulating into it
         memset(dst->data, 0, ggml_nbytes(dst));
     }
-    ggml_barrier(params->shared);
+    ggml_barrier_internal(params->shared);
 
     const int32_t s0 = ((const int32_t*)(dst->op_params))[0];
 
@@ -18695,7 +18767,7 @@ static void ggml_compute_forward_conv_transpose_1d_f32(
         // need to zero dst since we are accumulating into it
         memset(dst->data, 0, ggml_nbytes(dst));
     }
-    ggml_barrier(params->shared);
+    ggml_barrier_internal(params->shared);
 
     const int32_t s0 = ((const int32_t*)(dst->op_params))[0];
 
@@ -19058,7 +19130,7 @@ static void ggml_compute_forward_conv_2d_impl(const struct ggml_compute_params *
             }
         }   // patches handled by this thread
 
-        ggml_barrier(params->shared);
+        ggml_barrier_internal(params->shared);
 
         float * gemm_output = (float *) ((char *) tmp + patches_per_batch * knl_n * traits->type_size);
 
@@ -19067,7 +19139,7 @@ static void ggml_compute_forward_conv_2d_impl(const struct ggml_compute_params *
         // GEMM: patches[patch_n, knl_n] × kernel[knl_n, c_out] = output[patch_n, c_out]
         ggml_call_mul_mat(kernel_type, params, patch_n, c_out, knl_n, tmp, knl_data, gemm_output);
 
-        ggml_barrier(params->shared);
+        ggml_barrier_internal(params->shared);
 
         //permute back [OC, N, OH, OW] to [N, OC, OH, OW]
         const int64_t permute_per_thread = (patch_n + params->nth - 1) / params->nth;
@@ -19331,7 +19403,7 @@ static void ggml_compute_forward_conv_transpose_2d(
 
         memset(dst->data, 0, ggml_nbytes(dst));
     }
-    ggml_barrier(params->shared);
+    ggml_barrier_internal(params->shared);
 
     const int32_t stride = ggml_get_op_params_i32(dst, 0);
 
@@ -20215,7 +20287,7 @@ static void ggml_compute_forward_flash_attn_back_f32(
     if (ith == 0) {
         memset(dst->data, 0, nb0*ne0*ne1*ne2*ne3);
     }
-    ggml_barrier(params->shared);
+    ggml_barrier_internal(params->shared);
 
     const int64_t elem_q = ggml_nelements(q);
     const int64_t elem_k = ggml_nelements(k);
@@ -21609,7 +21681,7 @@ static void ggml_compute_forward_add_rel_pos_f32(
         if (params->ith == 0) {
             memcpy((char *) dst->data, (char *) src0->data, ggml_nbytes(dst));
         }
-        ggml_barrier(params->shared);
+        ggml_barrier_internal(params->shared);
     }
     // ref: https://github.com/facebookresearch/segment-anything/blob/main/segment_anything/modeling/image_encoder.py#L357-L359
 
@@ -21894,7 +21966,7 @@ static void ggml_compute_forward_cross_entropy_loss_f32(
     if (ith == 0) {
         memset(sums, 0, sizeof(float) * (nth + nth * nc));
     }
-    ggml_barrier(params->shared);
+    ggml_barrier_internal(params->shared);
 
     const double eps = 1e-9;
 
@@ -21942,7 +22014,7 @@ static void ggml_compute_forward_cross_entropy_loss_f32(
         }
 #endif
     }
-    ggml_barrier(params->shared);
+    ggml_barrier_internal(params->shared);
 
     if (ith == 0) {
         float * dp = (float *) dst->data;
@@ -22066,6 +22138,14 @@ static int ggml_compute_forward(struct ggml_compute_params * params, struct ggml
     if (tensor->op == GGML_OP_NONE || ggml_is_empty(tensor)) {
         return i;
     }
+
+#ifdef GGML_USE_AMX
+    // Check for custom compute (AMX, etc.) via tensor_traits
+    // This allows backends to override standard dispatch for specific operations
+    if (ggml_cpu_extra_compute_forward(params, tensor)) {
+        return i;  // Custom compute handled it, skip default dispatch
+    }
+#endif
 
 #if IK_PRINT_TIMING
     int64_t t1 = ggml_time_us();
@@ -24467,7 +24547,7 @@ static thread_ret_t ggml_graph_compute_thread(void * data) {
             state->shared->ec = GGML_STATUS_ABORTED;
         }
 
-        ggml_barrier(state->shared);
+        ggml_barrier_internal(state->shared);
 
         if (state->shared->ec != GGML_STATUS_SUCCESS) {
             break;

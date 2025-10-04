@@ -3,6 +3,21 @@
 #include "ggml.h"
 #include "ggml-alloc.h"
 
+// Compatibility: define GGML_BACKEND_API for ported upstream code
+#ifdef GGML_BACKEND_SHARED
+#    if defined(_WIN32) && !defined(__MINGW32__)
+#        ifdef GGML_BACKEND_BUILD
+#            define GGML_BACKEND_API __declspec(dllexport) extern
+#        else
+#            define GGML_BACKEND_API __declspec(dllimport) extern
+#        endif
+#    else
+#        define GGML_BACKEND_API __attribute__ ((visibility ("default"))) extern
+#    endif
+#else
+#    define GGML_BACKEND_API extern
+#endif
+
 #ifdef  __cplusplus
 extern "C" {
 #endif
@@ -109,8 +124,19 @@ extern "C" {
 
     GGML_API GGML_CALL ggml_backend_buffer_type_t ggml_backend_cpu_buffer_type(void);
 
+    // Get array of extra CPU buffer types (AMX, etc.) - NULL terminated
+    GGML_API GGML_CALL ggml_backend_buffer_type_t * ggml_backend_cpu_get_extra_bufts(void);
+
+    // Check if buffer type supports an operation
+    GGML_API GGML_CALL bool ggml_backend_buft_supports_op(ggml_backend_buffer_type_t buft, const struct ggml_tensor * op);
+
 #ifdef GGML_USE_CPU_HBM
     GGML_API ggml_backend_buffer_type_t ggml_backend_cpu_hbm_buffer_type(void);
+#endif
+
+#ifdef GGML_USE_AMX
+    // AMX repack buffer type - unpacks weights once at model load
+    GGML_API ggml_backend_buffer_type_t ggml_backend_amx_repack_buffer_type(void);
 #endif
 
     //

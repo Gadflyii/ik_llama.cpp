@@ -379,6 +379,7 @@ extern "C" {
         bool repack_tensors;// repack if available
         bool use_thp;       // use transparent huge pages (linux only)
         bool validate_quants; // if true, check for NaNs while loading the model
+        bool use_amx;       // use AMX acceleration for weight repacking
     };
 
     // NOTE: changing the default values of parameters marked as [EXPERIMENTAL] may cause crashes or incorrect results in certain configurations

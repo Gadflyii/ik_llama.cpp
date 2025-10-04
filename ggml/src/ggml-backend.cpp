@@ -2,6 +2,8 @@
 #include "ggml-alloc.h"
 #include "ggml-impl.h"
 #include "ggml-rpc.h"
+#include "ggml-cpu/amx/amx.h"
+#include "ggml-cpu/traits.h"
 
 #include <cassert>
 #include <climits>
@@ -729,6 +731,50 @@ GGML_CALL ggml_backend_buffer_type_t ggml_backend_cpu_buffer_type(void) {
     return &ggml_backend_cpu_buffer_type;
 }
 
+// Extra buffer types (AMX, etc.)
+GGML_CALL ggml_backend_buffer_type_t * ggml_backend_cpu_get_extra_bufts(void) {
+    static ggml_backend_buffer_type_t bufts[8] = {NULL};  // Max 7 extra types + NULL terminator
+    static bool initialized = false;
+
+    if (!initialized) {
+        int idx = 0;
+
+#if defined(__AMX_INT8__) && defined(__AVX512VNNI__)
+        ggml_backend_buffer_type_t amx_buft = ggml_backend_amx_buffer_type();
+        if (amx_buft) {
+            bufts[idx++] = amx_buft;
+        }
+#endif
+
+        bufts[idx] = NULL;  // NULL terminator
+        initialized = true;
+    }
+
+    return bufts;
+}
+
+// Check if buffer type supports operation by testing with CPU backend
+GGML_CALL bool ggml_backend_buft_supports_op(ggml_backend_buffer_type_t buft, const struct ggml_tensor * op) {
+    if (!op || !buft) {
+        return false;
+    }
+
+    // AMX and other extra buffer types have a context that implements extra_buffer_type interface
+    if (buft->context) {
+        // Cast to extra_buffer_type and call its supports_op method
+        // This properly checks if the tensor type (Q4_0, Q4_1, etc.) is compatible with AMX
+        ggml::cpu::extra_buffer_type * extra_buft = static_cast<ggml::cpu::extra_buffer_type *>(buft->context);
+        if (extra_buft) {
+            // Note: supports_op requires a device, but we don't have one here
+            // For AMX (CPU-based), we can pass nullptr as device since it doesn't use it
+            return extra_buft->supports_op(nullptr, op);
+        }
+    }
+
+    // Host buffers support all operations
+    return ggml_backend_buft_is_host(buft);
+}
+
 #ifdef GGML_USE_CPU_HBM
 
 // buffer type HBM
@@ -784,6 +830,29 @@ ggml_backend_buffer_type_t ggml_backend_cpu_hbm_buffer_type(void) {
     return &ggml_backend_cpu_buffer_type_hbm;
 }
 #endif
+
+// AMX buffer type support (upstream pattern)
+// Header already included at top of file
+
+// Get extra buffer types for CPU backend (AMX, etc.)
+// This function is called during backend initialization to register additional buffer types
+std::vector<ggml_backend_buffer_type_t> & ggml_backend_cpu_get_extra_buffer_types(void) {
+    static std::vector<ggml_backend_buffer_type_t> bufts;
+    static bool initialized = false;
+
+    if (!initialized) {
+#if defined(GGML_USE_AMX) && defined(__AMX_INT8__) && defined(__AVX512VNNI__)
+        // Register AMX buffer type if available
+        ggml_backend_buffer_type_t amx_buft = ggml_backend_amx_buffer_type();
+        if (amx_buft) {
+            bufts.push_back(amx_buft);
+        }
+#endif
+        initialized = true;
+    }
+
+    return bufts;
+}
 
 struct ggml_backend_cpu_context {
     int n_threads;

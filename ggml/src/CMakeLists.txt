@@ -1527,9 +1527,16 @@ add_library(ggml
             ${GGML_SOURCES_IQK}       ${GGML_HEADERS_IQK}
             ${GGML_SOURCES_CANN}      ${GGML_HEADERS_CANN}
             ggml-aarch64.c            ggml-aarch64.h
-            ggml-amx.c                ggml-amx.h
-            ggml-amx-impl.c
-            ggml-amx-kernel.c
+            ggml-cpu-traits.cpp       ggml-cpu-traits.h
+            ggml-cpu/ggml-cpu-impl.h
+            ggml-cpu/simd-mappings.h
+            ggml-cpu/quants.h
+            ggml-cpu/traits.h
+            ggml-cpu/amx/common.h
+            ggml-cpu/amx/mmq.h
+            ggml-cpu/amx/mmq.cpp
+            ggml-cpu/amx/amx.h
+            ggml-cpu/amx/amx.cpp
             )
 
 if (EMSCRIPTEN)
@@ -1538,14 +1545,14 @@ endif()
 
 # AMX compile definitions
 if (GGML_AMX OR GGML_AMX_INT8 OR GGML_AMX_BF16)
-    target_compile_definitions(ggml PRIVATE GGML_USE_AMX)
+    target_compile_definitions(ggml PUBLIC GGML_USE_AMX)
     message(STATUS "Intel AMX support enabled")
     if (GGML_AMX_INT8)
-        target_compile_definitions(ggml PRIVATE GGML_USE_AMX_INT8)
+        target_compile_definitions(ggml PUBLIC GGML_USE_AMX_INT8)
         message(STATUS "  - AMX-INT8 enabled (quantized types)")
     endif()
     if (GGML_AMX_BF16)
-        target_compile_definitions(ggml PRIVATE GGML_USE_AMX_BF16)
+        target_compile_definitions(ggml PUBLIC GGML_USE_AMX_BF16)
         message(STATUS "  - AMX-BF16 enabled (floating point types)")
     endif()
 endif()
@@ -1563,6 +1570,14 @@ find_library(MATH_LIBRARY m)
 if (MATH_LIBRARY)
     if (NOT WIN32 OR NOT GGML_SYCL)
         target_link_libraries(ggml PRIVATE ${MATH_LIBRARY})
+    endif()
+endif()
+
+# Link libnuma for NUMA-aware parallel repacking
+if (UNIX AND NOT APPLE)
+    find_library(NUMA_LIBRARY numa)
+    if (NUMA_LIBRARY)
+        target_link_libraries(ggml PRIVATE ${NUMA_LIBRARY})
     endif()
 endif()
 
