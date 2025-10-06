@@ -353,6 +353,33 @@ static bool ggml_are_same_layout(const struct ggml_tensor * a, const struct ggml
     return true;
 }
 
+// Check if tensor is a model weight/parameter (should not be copied during inference)
+// Weights are read-only model parameters that stay resident on their allocated backend.
+// Only intermediate activations should flow between backends during inference.
+static bool ggml_tensor_is_weight(const struct ggml_tensor * tensor) {
+    if (!tensor || !tensor->name) {
+        return false;
+    }
+
+    // Check tensor flags first (most reliable)
+    if (tensor->flags & GGML_TENSOR_FLAG_PARAM) {
+        return true;
+    }
+
+    // Check name patterns for common weight tensor names
+    // This catches weights that might not have the PARAM flag set
+    const char * name = tensor->name;
+    if (strstr(name, ".weight") != NULL ||
+        strstr(name, ".bias") != NULL ||
+        strstr(name, "token_embd.weight") != NULL ||
+        strstr(name, "output.weight") != NULL ||
+        strstr(name, "output_norm.weight") != NULL) {
+        return true;
+    }
+
+    return false;
+}
+
 void ggml_backend_tensor_copy(struct ggml_tensor * src, struct ggml_tensor * dst) {
     GGML_ASSERT(ggml_are_same_layout(src, dst) && "cannot copy tensors with different layouts");
 
@@ -360,14 +387,50 @@ void ggml_backend_tensor_copy(struct ggml_tensor * src, struct ggml_tensor * dst
         return;
     }
 
+    // ===== PREVENT AMX WEIGHT TENSOR COPIES (AMX+GPU SCHEDULER FIX) =====
+    // AMX buffers store weights in VNNI format which cannot be read directly.
+    // The scheduler should never try to copy weights from AMX buffers to other backends.
+    // Weights should stay resident on their allocated backend; only activations flow between backends.
+    if (src->buffer && dst->buffer && ggml_tensor_is_weight(src)) {
+        const char * src_buf_name = ggml_backend_buffer_name(src->buffer);
+        const char * dst_buf_name = ggml_backend_buffer_name(dst->buffer);
+
+        // Check if trying to copy FROM an AMX buffer
+        // AMX buffers have "AMX" in their name and store data in VNNI format
+        bool is_amx_source = (strstr(src_buf_name, "AMX") != NULL);
+
+        // Check if copying to a different backend
+        bool different_backend = (src->buffer != dst->buffer);
+
+        if (is_amx_source && different_backend) {
+            // This is the bug: trying to copy AMX VNNI-formatted weight to another backend
+            fprintf(stderr, "\n\nERROR: Attempted to copy weight tensor '%s' from AMX buffer:\n",
+                    src->name ? src->name : "(unnamed)");
+            fprintf(stderr, "  Source backend: %s (VNNI format - cannot be read directly)\n", src_buf_name);
+            fprintf(stderr, "  Dest backend: %s\n", dst_buf_name);
+            fprintf(stderr, "\n");
+            fprintf(stderr, "  This indicates a scheduler bug. AMX weights are in VNNI format and\n");
+            fprintf(stderr, "  cannot be copied to other backends. The operation that needs this\n");
+            fprintf(stderr, "  weight should be scheduled on the CPU backend where the weight resides,\n");
+            fprintf(stderr, "  or the weight should be allocated in a GPU-accessible buffer instead.\n\n");
+
+            GGML_ASSERT(false && "Cannot copy AMX VNNI-formatted weight tensors to other backends");
+        }
+    }
+    // ===== END AMX WEIGHT TENSOR COPY PREVENTION =====
+
     if (ggml_backend_buffer_is_host(src->buffer)) {
         ggml_backend_tensor_set(dst, src->data, 0, ggml_nbytes(src));
     } else if (ggml_backend_buffer_is_host(dst->buffer)) {
         ggml_backend_tensor_get(src, dst->data, 0, ggml_nbytes(src));
     } else if (!ggml_backend_buffer_copy_tensor(src, dst)) {
-#ifndef NDEBUG
+        #ifdef GGML_DEBUG_TENSOR_COPY
+        fprintf(stderr, "  → Using slow fallback path (get_tensor + set_tensor)\n");
+        #endif
+
+        #ifndef NDEBUG
         fprintf(stderr, "%s: warning: slow copy from %s to %s\n", __func__, ggml_backend_buffer_name(src->buffer), ggml_backend_buffer_name(dst->buffer));
-#endif
+        #endif
         size_t nbytes = ggml_nbytes(src);
         void * data = malloc(nbytes);
         ggml_backend_tensor_get(src, data, 0, nbytes);
@@ -1358,8 +1421,19 @@ static int ggml_backend_sched_backend_id_from_cur(ggml_backend_sched_t sched, st
         }
         if (src->buffer != NULL && src->buffer->usage == GGML_BACKEND_BUFFER_USAGE_WEIGHTS) {
             int src_backend_id = ggml_backend_sched_backend_from_buffer(sched, src, tensor);
+
+            // AMX+GPU FIX: Check if weight is in AMX buffer (VNNI format, cannot be copied)
+            // AMX buffers store weights in VNNI format which cannot be read by other backends.
+            // Operations using AMX weights MUST run on CPU backend, never offload to GPU.
+            bool is_amx_weight = false;
+            if (src->buffer) {
+                const char * buf_name = ggml_backend_buffer_name(src->buffer);
+                is_amx_weight = (strstr(buf_name, "AMX") != NULL);
+            }
+
             // check if a backend with higher prio wants to offload the op
-            if (offload_enabled && src_backend_id == sched->n_backends - 1) {
+            // BUT: never offload if weight is in AMX buffer (cannot be copied)
+            if (offload_enabled && !is_amx_weight && src_backend_id == sched->n_backends - 1) {
                 for (int b = 0; b < src_backend_id; b++) {
                     if (ggml_backend_supports_op(sched->backends[b], tensor) && ggml_backend_offload_op(sched->backends[b], tensor)) {
                         SET_CAUSE(tensor, "1.off");
