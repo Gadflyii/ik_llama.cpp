@@ -266,7 +266,11 @@ static size_t ggml_backend_amx_buffer_type_get_alloc_size(ggml_backend_buffer_ty
 
 static bool ggml_backend_amx_buffer_type_is_host(ggml_backend_buffer_type_t buft) {
     GGML_UNUSED(buft);
-    return true;  // AMX buffers are host-accessible and use CPU backend for compute
+    // AMX buffers use special aligned memory with converted VNNI-format weights.
+    // Returning false prevents other backends from assuming direct memory access.
+    // This forces proper copy operations through the scheduler when needed.
+    // In CPU+GPU hybrid mode, this prevents CUDA from directly reading AMX memory.
+    return false;
 }
 
 #define ARCH_GET_XCOMP_PERM     0x1022

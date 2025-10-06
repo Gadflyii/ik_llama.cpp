@@ -957,6 +957,16 @@ GGML_CALL static bool ggml_backend_cpu_supports_op(ggml_backend_t backend, const
                 op->type != GGML_TYPE_IQ1_S   &&
                 op->type != GGML_TYPE_IQ1_M; // missing type_traits.from_float
         case GGML_OP_MUL_MAT:
+            // For operations with src[0] in AMX buffer, check AMX-specific constraints
+            // AMX requires src[1] to be F32 and in host buffer, which regular CPU doesn't care about
+            if (op->src[0] && op->src[0]->buffer && op->src[0]->buffer->buft) {
+                // Let buffer type decide if it can handle this specific operation
+                // This calls AMX's extra_buffer_type::supports_op() which checks:
+                // - src[1] is F32
+                // - src[1] is in host buffer (not AMX buffer)
+                // - Dimensions are contiguous 2D
+                return ggml_backend_buft_supports_op(op->src[0]->buffer->buft, op);
+            }
             return true;
             //return op->src[1]->type == GGML_TYPE_F32 || op->src[1]->type == ggml_internal_get_type_traits(op->src[0]->type).vec_dot_type;
         default:
@@ -967,7 +977,19 @@ GGML_CALL static bool ggml_backend_cpu_supports_op(ggml_backend_t backend, const
 }
 
 GGML_CALL static bool ggml_backend_cpu_supports_buft(ggml_backend_t backend, ggml_backend_buffer_type_t buft) {
-    return ggml_backend_buft_is_host(buft);
+    // CPU backend supports host buffers and also AMX buffers (which are CPU-based but not "host")
+    if (ggml_backend_buft_is_host(buft)) {
+        return true;
+    }
+
+#ifdef GGML_USE_AMX
+    // AMX buffers are CPU-based even though is_host=false
+    if (buft == ggml_backend_amx_buffer_type()) {
+        return true;
+    }
+#endif
+
+    return false;
 
     GGML_UNUSED(backend);
 }

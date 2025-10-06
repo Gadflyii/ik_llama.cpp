@@ -1,5 +1,6 @@
 #include "ggml-cpu-traits.h"
 #include "ggml.h"
+#include <cstring>
 
 // Virtual destructor implementation
 ggml::cpu::tensor_traits::~tensor_traits() = default;

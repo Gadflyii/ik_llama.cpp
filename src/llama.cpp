@@ -1801,11 +1801,20 @@ static ggml_backend_buffer_type_t select_weight_buft(const struct ggml_tensor * 
     // Expert weights have "exps" in their name (ffn_gate_exps, ffn_down_exps, ffn_up_exps)
     const bool is_moe_expert = strstr(tensor->name, "exps") != nullptr;
 
+    // TEMPORARY: Confirm Q+K in AMX works with CUDA, but Q+K+V fails
+    const bool is_attn_output = strstr(tensor->name, "attn_output") != nullptr;
+    const bool is_attn_q = strstr(tensor->name, "attn_q") != nullptr;
+    const bool is_attn_k = strstr(tensor->name, "attn_k") != nullptr;
+    const bool is_attn_v = strstr(tensor->name, "attn_v") != nullptr;
+    // Test: Enable all Q/K/V to find the root cause
+    const bool allow_amx_for_this_tensor = is_attn_output || is_attn_q || is_attn_k || is_attn_v;
+
     for (auto buft : buft_list) {
         // Skip AMX buffer type for F32 tensors or MoE expert weights
+        // ALSO skip if not explicitly allowed (debugging)
         const char * buft_name = ggml_backend_buft_name(buft);
-        if ((!amx_compatible || is_moe_expert) && buft_name && strstr(buft_name, "AMX")) {
-            continue;  // Skip AMX for F32 tensors and MoE experts
+        if ((!amx_compatible || is_moe_expert || !allow_amx_for_this_tensor) && buft_name && strstr(buft_name, "AMX")) {
+            continue;  // Skip AMX except for attn_output
         }
 
         // Note: we don't call ggml_backend_buft_supports_op here because it expects
@@ -1825,6 +1834,7 @@ static buft_list_t make_cpu_buft_list(bool use_amx_buffers, bool gpu_present) {
     buft_list_t buft_list;
 
     // Add AMX buffer types if requested (via --amx flag)
+    // AMX weights use converted VNNI format, but with is_host=false, proper copies are enforced
     if (use_amx_buffers) {
         ggml_backend_buffer_type_t * extra_bufts = ggml_backend_cpu_get_extra_bufts();
         while (extra_bufts && *extra_bufts) {
