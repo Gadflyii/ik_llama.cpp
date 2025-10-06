@@ -957,16 +957,8 @@ GGML_CALL static bool ggml_backend_cpu_supports_op(ggml_backend_t backend, const
                 op->type != GGML_TYPE_IQ1_S   &&
                 op->type != GGML_TYPE_IQ1_M; // missing type_traits.from_float
         case GGML_OP_MUL_MAT:
-            // For operations with src[0] in AMX buffer, check AMX-specific constraints
-            // AMX requires src[1] to be F32 and in host buffer, which regular CPU doesn't care about
-            if (op->src[0] && op->src[0]->buffer && op->src[0]->buffer->buft) {
-                // Let buffer type decide if it can handle this specific operation
-                // This calls AMX's extra_buffer_type::supports_op() which checks:
-                // - src[1] is F32
-                // - src[1] is in host buffer (not AMX buffer)
-                // - Dimensions are contiguous 2D
-                return ggml_backend_buft_supports_op(op->src[0]->buffer->buft, op);
-            }
+            // CPU backend can always handle MUL_MAT operations
+            // The buffer type's supports_op() is checked elsewhere to determine if AMX acceleration can be used
             return true;
             //return op->src[1]->type == GGML_TYPE_F32 || op->src[1]->type == ggml_internal_get_type_traits(op->src[0]->type).vec_dot_type;
         default:
@@ -1300,7 +1292,7 @@ static int ggml_backend_sched_backend_id(ggml_backend_sched_t sched, ggml_backen
 }
 
 static int ggml_backend_sched_backend_from_buffer(ggml_backend_sched_t sched, const struct ggml_tensor * tensor, const struct ggml_tensor * op) {
-    ggml_backend_buffer_t buffer = tensor->buffer;
+    ggml_backend_buffer_t buffer = tensor->view_src ? tensor->view_src->buffer : tensor->buffer;
     if (buffer == NULL) {
         return -1;
     }
