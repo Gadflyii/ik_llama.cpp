@@ -130,29 +130,78 @@ static void GGML_CALL ggml_backend_amx_buffer_set_tensor(ggml_backend_buffer_t b
     GGML_UNUSED(buffer);
 }
 
-/*
-// need to figure what we need to do with buffer->extra.
-static void ggml_backend_amx_buffer_get_tensor(ggml_backend_buffer_t buffer, const struct ggml_tensor * tensor, void * data, size_t offset, size_t size) {
-    GGML_ASSERT(!qtype_has_amx_kernels(tensor->type));
+static void GGML_CALL ggml_backend_amx_buffer_get_tensor(ggml_backend_buffer_t buffer, const struct ggml_tensor * tensor, void * data, size_t offset, size_t size) {
+    // AMX buffers store weights in VNNI format, which cannot be read directly
+    // This function should not be called for AMX-formatted tensors
+    // If copy operations need to read from AMX buffers, they should use cpy_tensor instead
+    if (qtype_has_amx_kernels(tensor->type)) {
+        fprintf(stderr, "\n\nERROR: Attempt to read AMX-formatted tensor:\n");
+        fprintf(stderr, "  tensor name: %s\n", tensor->name);
+        fprintf(stderr, "  tensor type: %d\n", tensor->type);
+        fprintf(stderr, "  tensor size: %zu bytes\n", ggml_nbytes(tensor));
+        fprintf(stderr, "  offset: %zu, size: %zu\n", offset, size);
+        fprintf(stderr, "This indicates a buffer is trying to copy from AMX without proper cpy_tensor support\n\n");
+        GGML_ASSERT(false && "Cannot directly read AMX-formatted tensor data");
+    }
     memcpy(data, (const char *)tensor->data + offset, size);
 
     GGML_UNUSED(buffer);
 }
 
-static bool ggml_backend_amx_buffer_cpy_tensor(ggml_backend_buffer_t buffer, const struct ggml_tensor * src, struct ggml_tensor * dst) {
+static bool GGML_CALL ggml_backend_amx_buffer_cpy_tensor(ggml_backend_buffer_t buffer, const struct ggml_tensor * src, struct ggml_tensor * dst) {
+    // Handle copy FROM host buffer TO AMX buffer
     if (ggml_backend_buffer_is_host(src->buffer)) {
-        if (qtype_has_amx_kernels(src->type)) {
+#if defined(__linux__)
+        // Check if this is a mirror buffer using magic number (same logic as set_tensor)
+        if (buffer->context) {
+            struct ggml_numa_mirror_buffer * mirror = (struct ggml_numa_mirror_buffer *) buffer->context;
+            // Verify magic number and replicate if needed
+            if (mirror->magic == GGML_MIRROR_BUFFER_MAGIC && mirror->n_replicas > 1 && mirror->read_only) {
+                // This is a read-only mirror buffer - replicate to all nodes
+                void * buffer_base = mirror->original_base ? mirror->original_base : mirror->replicas[mirror->active_nodes[0]];
+                size_t tensor_offset = (char *)dst->data - (char *)buffer_base;
+
+                for (uint32_t i = 0; i < mirror->n_replicas; i++) {
+                    uint32_t node = mirror->active_nodes[i];
+                    void * original_data = dst->data;
+                    dst->data = (char *)mirror->replicas[node] + tensor_offset;
+
+                    // Convert/copy to this replica
+                    if (qtype_has_amx_kernels(dst->type)) {
+                        ggml_backend_amx_convert_weight(dst, src->data, 0, ggml_nbytes(dst));
+                    } else {
+                        memcpy(dst->data, src->data, ggml_nbytes(src));
+                    }
+
+                    dst->data = original_data;
+                }
+                return true;
+            }
+        }
+#endif
+        // Regular (non-mirror) buffer: copy from host to AMX
+        if (qtype_has_amx_kernels(dst->type)) {
             ggml_backend_amx_convert_weight(dst, src->data, 0, ggml_nbytes(dst));
         } else {
             memcpy(dst->data, src->data, ggml_nbytes(src));
         }
         return true;
     }
+
+    // Handle copy FROM AMX buffer TO host buffer
+    if (ggml_backend_buffer_is_host(dst->buffer)) {
+        // AMX-formatted tensors cannot be read directly - this should not happen
+        // during normal operation since AMX weights are read-only after conversion
+        GGML_ASSERT(!qtype_has_amx_kernels(src->type) && "Cannot copy AMX-formatted tensor to host");
+        memcpy(dst->data, src->data, ggml_nbytes(src));
+        return true;
+    }
+
+    // AMX-to-AMX or AMX-to-other-device copies not supported
     return false;
 
     GGML_UNUSED(buffer);
 }
-*/
 
 static void GGML_CALL ggml_backend_amx_buffer_clear(ggml_backend_buffer_t buffer, uint8_t value) {
     memset(buffer->context, value, buffer->size);
@@ -166,8 +215,8 @@ static ggml_backend_buffer_i ggml_backend_amx_buffer_interface = {
     /* .init_tensor     = */ ggml_backend_amx_buffer_init_tensor,
     /* .memset_tensor   = */ ggml_backend_amx_buffer_memset_tensor,
     /* .set_tensor      = */ ggml_backend_amx_buffer_set_tensor,
-    /* .get_tensor      = */ nullptr,
-    /* .cpy_tensor      = */ nullptr,
+    /* .get_tensor      = */ ggml_backend_amx_buffer_get_tensor,
+    /* .cpy_tensor      = */ ggml_backend_amx_buffer_cpy_tensor,
     /* .clear           = */ ggml_backend_amx_buffer_clear,
     /* .reset           = */ nullptr,
 };
